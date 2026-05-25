@@ -24,20 +24,21 @@ from rsl_rl.utils import split_and_pad_trajectories
 
 
 class RolloutStorage:
+    # 嵌套类 Transition：用于在每个仿真步临时传递一帧的数据包
     class Transition:
         def __init__(self):
-            self.observations = None
-            self.privileged_observations = None
-            self.actions = None
-            self.privileged_actions = None
-            self.rewards = None
-            self.dones = None
-            self.values = None
-            self.actions_log_prob = None
-            self.action_mean = None
-            self.action_sigma = None
-            self.hidden_states = None
-            self.rnd_state = None
+            self.observations = None            # Actor 观测值 (BatchSize, 750)
+            self.privileged_observations = None # Critic 观测值 (BatchSize, 800)
+            self.actions = None                 # 策略输出动作 (BatchSize, 20)
+            self.privileged_actions = None      # 蒸馏时 Teacher 动作
+            self.rewards = None                 # 奖励值 (BatchSize, 1)
+            self.dones = None                   # 回合终止标志 (BatchSize, 1)
+            self.values = None                  # Critic 评分值 V(s) (BatchSize, 1)
+            self.actions_log_prob = None        # 动作对数概率 log_prob (BatchSize, 1)
+            self.action_mean = None             # 动作分布均值 (BatchSize, 20)
+            self.action_sigma = None            # 动作分布标准差 (BatchSize, 20)
+            self.hidden_states = None           # RNN 隐藏状态
+            self.rnd_state = None               # RND 状态
 
         def clear(self):
             self.__init__()
@@ -53,17 +54,18 @@ class RolloutStorage:
         rnd_state_shape=None,
         device="cpu",
     ):
-        # store inputs
+        # 存储基本输入参数
         self.training_type = training_type
         self.device = device
-        self.num_transitions_per_env = num_transitions_per_env
-        self.num_envs = num_envs
+        self.num_transitions_per_env = num_transitions_per_env  # 每个环境采样的总步数 (通常为 24)
+        self.num_envs = num_envs                                # 并行环境个数 (通常为 4096)
         self.obs_shape = obs_shape
         self.privileged_obs_shape = privileged_obs_shape
         self.rnd_state_shape = rnd_state_shape
         self.actions_shape = actions_shape
 
-        # Core
+        # ====== 1. 在 GPU 上预分配数据存储张量（Tensor），避免运行时动态开辟内存 ======
+        # 维度结构统一为：(单环境采样步数, 环境数, 特征维度)
         self.observations = torch.zeros(num_transitions_per_env, num_envs, *obs_shape, device=self.device)
         if privileged_obs_shape is not None:
             self.privileged_observations = torch.zeros(
@@ -75,36 +77,36 @@ class RolloutStorage:
         self.actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
 
-        # for distillation
+        # 如果是策略蒸馏模式，预分配 Teacher 动作的存储空间
         if training_type == "distillation":
             self.privileged_actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
 
-        # for reinforcement learning
+        # 如果是标准强化学习模式，预分配值函数、概率以及 GAE 计算所需的 Tensor
         if training_type == "rl":
             self.values = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.actions_log_prob = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.mu = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
             self.sigma = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
-            self.returns = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
-            self.advantages = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+            self.returns = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)     # 目标回报回报 R_t
+            self.advantages = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)  # 优势估计 A_t
 
-        # For RND
+        # 为 RND 好奇心状态预分配空间
         if rnd_state_shape is not None:
             self.rnd_state = torch.zeros(num_transitions_per_env, num_envs, *rnd_state_shape, device=self.device)
 
-        # For RNN networks
+        # 为 RNN/GRU 网络保存隐藏状态的占位符
         self.saved_hidden_states_a = None
         self.saved_hidden_states_c = None
 
-        # counter for the number of transitions stored
+        # 记录当前采样到第几步 (0 ~ num_transitions_per_env)
         self.step = 0
 
     def add_transitions(self, transition: Transition):
-        # check if the transition is valid
+        """将当前时间步环境和策略产生的一帧数据拷贝进预分配的 Rollout Buffer 中"""
         if self.step >= self.num_transitions_per_env:
             raise OverflowError("Rollout buffer overflow! You should call clear() before adding new transitions.")
 
-        # Core
+        # 使用 copy_ 进行显存级的快速值覆盖
         self.observations[self.step].copy_(transition.observations)
         if self.privileged_observations is not None:
             self.privileged_observations[self.step].copy_(transition.privileged_observations)
@@ -112,34 +114,30 @@ class RolloutStorage:
         self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
 
-        # for distillation
         if self.training_type == "distillation":
             self.privileged_actions[self.step].copy_(transition.privileged_actions)
 
-        # for reinforcement learning
         if self.training_type == "rl":
             self.values[self.step].copy_(transition.values)
             self.actions_log_prob[self.step].copy_(transition.actions_log_prob.view(-1, 1))
             self.mu[self.step].copy_(transition.action_mean)
             self.sigma[self.step].copy_(transition.action_sigma)
 
-        # For RND
         if self.rnd_state_shape is not None:
             self.rnd_state[self.step].copy_(transition.rnd_state)
 
-        # For RNN networks
+        # 处理循环神经网络 RNN 隐藏状态的保存
         self._save_hidden_states(transition.hidden_states)
 
-        # increment the counter
+        # 采样指针自增
         self.step += 1
 
     def _save_hidden_states(self, hidden_states):
+        """为循环网络保存当前步的隐藏层特征"""
         if hidden_states is None or hidden_states == (None, None):
             return
-        # make a tuple out of GRU hidden state sto match the LSTM format
         hid_a = hidden_states[0] if isinstance(hidden_states[0], tuple) else (hidden_states[0],)
         hid_c = hidden_states[1] if isinstance(hidden_states[1], tuple) else (hidden_states[1],)
-        # initialize if needed
         if self.saved_hidden_states_a is None:
             self.saved_hidden_states_a = [
                 torch.zeros(self.observations.shape[0], *hid_a[i].shape, device=self.device) for i in range(len(hid_a))
@@ -147,35 +145,46 @@ class RolloutStorage:
             self.saved_hidden_states_c = [
                 torch.zeros(self.observations.shape[0], *hid_c[i].shape, device=self.device) for i in range(len(hid_c))
             ]
-        # copy the states
         for i in range(len(hid_a)):
             self.saved_hidden_states_a[i][self.step].copy_(hid_a[i])
             self.saved_hidden_states_c[i][self.step].copy_(hid_c[i])
 
     def clear(self):
+        """在每次模型更新结束、开启新一轮环境交互采样前，重置缓冲区指针"""
         self.step = 0
 
     def compute_returns(self, last_values, gamma, lam, normalize_advantage: bool = True):
+        """
+        根据采集到的整批轨迹数据，从后向前计算 GAE 优势函数值和 Discounted Return。
+        这是 PPO 策略梯度的核心算式。
+        """
         advantage = 0
+        # 从最后一步 (T-1) 倒序遍历计算到第 0 步
         for step in reversed(range(self.num_transitions_per_env)):
-            # if we are at the last step, bootstrap the return value
             if step == self.num_transitions_per_env - 1:
                 next_values = last_values
             else:
                 next_values = self.values[step + 1]
-            # 1 if we are not in a terminal state, 0 otherwise
+            
+            # 判断下一步机器人是否已经挂掉/超时（Done 为 1 时不计算下一步状态值）
             next_is_not_terminal = 1.0 - self.dones[step].float()
-            # TD error: r_t + gamma * V(s_{t+1}) - V(s_t)
+            
+            # 1. 计算时序差分误差 TD-Error (delta):
+            # delta = r_t + gamma * V(s_t+1) - V(s_t)
             delta = self.rewards[step] + next_is_not_terminal * gamma * next_values - self.values[step]
-            # Advantage: A(s_t, a_t) = delta_t + gamma * lambda * A(s_{t+1}, a_{t+1})
+            
+            # 2. 累积计算广义优势估计 GAE (Advantage):
+            # A_t = delta_t + gamma * lambda * A_t+1
             advantage = delta + next_is_not_terminal * gamma * lam * advantage
-            # Return: R_t = A(s_t, a_t) + V(s_t)
+            
+            # 3. 计算折扣回报目标值 Return (即用于监督更新 Critic 的 Target):
+            # R_t = A_t + V(s_t)
             self.returns[step] = advantage + self.values[step]
 
-        # Compute the advantages
+        # 4. 计算并保存最终优势 A(s, a) = R_t - V(s)
         self.advantages = self.returns - self.values
-        # Normalize the advantages if flag is set
-        # This is to prevent double normalization (i.e. if per minibatch normalization is used)
+        
+        # 5. 在整批样本上对 Advantage 进行归一化，极大稳定 PPO 更新梯度
         if normalize_advantage:
             self.advantages = (self.advantages - self.advantages.mean()) / (self.advantages.std() + 1e-8)
 

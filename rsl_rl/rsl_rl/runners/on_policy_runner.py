@@ -48,83 +48,81 @@ class OnPolicyRunner:
         self.device = device
         self.env = env
 
-        # check if multi-gpu is enabled
+        # ====== 1. 配置多 GPU 分布式训练 ======
         self._configure_multi_gpu()
 
-        # resolve training type depending on the algorithm
-        if self.alg_cfg["class_name"] == "PPO":
-            self.training_type = "rl"
+        # ====== 2. 根据算法类名解析训练类型 ======
+        if self.alg_cfg["class_name"] == "PPO" or self.alg_cfg["class_name"] == "AMPPPO":
+            self.training_type = "rl"              # 标准强化学习
         elif self.alg_cfg["class_name"] == "Distillation":
-            self.training_type = "distillation"
+            self.training_type = "distillation"    # 策略蒸馏（学徒模式）
         else:
             raise ValueError(f"Training type not found for algorithm {self.alg_cfg['class_name']}.")
 
-        # resolve dimensions of observations
-        obs, extras = self.env.get_observations()
-        num_obs = obs.shape[1]
+        # ====== 3. 获取并解析观测空间的维度 ======
+        obs, extras = self.env.get_observations()   # 触发环境计算一次观测
+        num_obs = obs.shape[1]                     # Actor 观测向量的维度
 
-        # resolve type of privileged observations
+        # ====== 4. 解析特权观测（Privileged Observations，即 Critic 专用的特权状态） ======
         if self.training_type == "rl":
             if "critic" in extras["observations"]:
-                self.privileged_obs_type = "critic"  # actor-critic reinforcement learnig, e.g., PPO
+                self.privileged_obs_type = "critic"  # Actor-Critic RL（如 PPO）使用的特权观测
             else:
                 self.privileged_obs_type = None
         if self.training_type == "distillation":
             if "teacher" in extras["observations"]:
-                self.privileged_obs_type = "teacher"  # policy distillation
+                self.privileged_obs_type = "teacher"  # 策略蒸馏中 Teacher 给 Student 提供的特权观测
             else:
                 self.privileged_obs_type = None
 
-        # resolve dimensions of privileged observations
+        # 确定特权观测的维度，如果没有特权观测，则与普通观测一致
         if self.privileged_obs_type is not None:
             num_privileged_obs = extras["observations"][self.privileged_obs_type].shape[1]
         else:
             num_privileged_obs = num_obs
 
-        # evaluate the policy class
-        policy_class = eval(self.policy_cfg.pop("class_name"))
+        # ====== 5. 动态创建策略模型 (ActorCritic 网络) ======
+        policy_class = eval(self.policy_cfg.pop("class_name"))   # 从配置中解析神经网络类名
         policy: ActorCritic | ActorCriticRecurrent | StudentTeacher | StudentTeacherRecurrent = policy_class(
             num_obs, num_privileged_obs, self.env.num_actions, **self.policy_cfg
-        ).to(self.device)
+        ).to(self.device)                                       # 实例化并送入 GPU
 
-        # resolve dimension of rnd gated state
+        # ====== 6. 解析 RND (随机网络蒸馏) 内在奖励的维度 (若启用) ======
         if "rnd_cfg" in self.alg_cfg and self.alg_cfg["rnd_cfg"] is not None:
-            # check if rnd gated state is present
             rnd_state = extras["observations"].get("rnd_state")
             if rnd_state is None:
                 raise ValueError("Observations for the key 'rnd_state' not found in infos['observations'].")
-            # get dimension of rnd gated state
             num_rnd_state = rnd_state.shape[1]
-            # add rnd gated state to config
             self.alg_cfg["rnd_cfg"]["num_states"] = num_rnd_state
-            # scale down the rnd weight with timestep (similar to how rewards are scaled down in legged_gym envs)
+            # 根据步长缩放 RND 权重
             self.alg_cfg["rnd_cfg"]["weight"] *= env.unwrapped.step_dt
 
-        # if using symmetry then pass the environment config object
+        # ====== 7. 配置对称性奖励 (Symmetry, 若启用) ======
         if "symmetry_cfg" in self.alg_cfg and self.alg_cfg["symmetry_cfg"] is not None:
-            # this is used by the symmetry function for handling different observation terms
             self.alg_cfg["symmetry_cfg"]["_env"] = env
 
-        # initialize algorithm
-        alg_class = eval(self.alg_cfg.pop("class_name"))
+        # ====== 8. 动态创建强化学习算法实例 (PPO/AMPPPO) ======
+        alg_class = eval(self.alg_cfg.pop("class_name"))         # 从配置中解析算法类名
         self.alg: PPO | Distillation = alg_class(
             policy, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg
         )
 
-        # store training configuration
-        self.num_steps_per_env = self.cfg["num_steps_per_env"]
-        self.save_interval = self.cfg["save_interval"]
-        self.empirical_normalization = self.cfg["empirical_normalization"]
+        # ====== 9. 存储基本训练超参数 ======
+        self.num_steps_per_env = self.cfg["num_steps_per_env"]    # 每次迭代中每个并行环境运行的步数 (Rollout长度)
+        self.save_interval = self.cfg["save_interval"]            # 每隔多少个迭代保存一次模型
+        self.empirical_normalization = self.cfg["empirical_normalization"] # 是否启用在线均值方差归一化
+
+        # 初始化归一化器（如果配置不启用则为恒等映射 Identity）
         if self.empirical_normalization:
             self.obs_normalizer = EmpiricalNormalization(shape=[num_obs], until=1.0e8).to(self.device)
             self.privileged_obs_normalizer = EmpiricalNormalization(shape=[num_privileged_obs], until=1.0e8).to(
                 self.device
             )
         else:
-            self.obs_normalizer = torch.nn.Identity().to(self.device)  # no normalization
-            self.privileged_obs_normalizer = torch.nn.Identity().to(self.device)  # no normalization
+            self.obs_normalizer = torch.nn.Identity().to(self.device)  # 不做归一化
+            self.privileged_obs_normalizer = torch.nn.Identity().to(self.device)
 
-        # init storage and model
+        # ====== 10. 初始化算法的经验存放区（Rollout Buffer） ======
         self.alg.init_storage(
             self.training_type,
             self.env.num_envs,
@@ -134,10 +132,9 @@ class OnPolicyRunner:
             [self.env.num_actions],
         )
 
-        # Decide whether to disable logging
-        # We only log from the process with rank 0 (main process)
+        # ====== 11. 日志和多进程管理 ======
+        # 分布式训练中，只有主进程 (rank 0) 允许输出日志，防止多个进程写冲突
         self.disable_logs = self.is_distributed and self.gpu_global_rank != 0
-        # Logging
         self.log_dir = log_dir
         self.writer = None
         self.tot_timesteps = 0
@@ -146,81 +143,80 @@ class OnPolicyRunner:
         self.git_status_repos = [rsl_rl.__file__]
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):  # noqa: C901
-        # initialize writer
+        """
+        强化学习与策略更新的核心训练主循环。
+        """
+        # ====== 1. 初始化日志记录器 (Tensorboard, Wandb 或 Neptune) ======
         if self.log_dir is not None and self.writer is None and not self.disable_logs:
-            # Launch either Tensorboard or Neptune & Tensorboard summary writer(s), default: Tensorboard.
             self.logger_type = self.cfg.get("logger", "tensorboard")
             self.logger_type = self.logger_type.lower()
 
             if self.logger_type == "neptune":
                 from rsl_rl.utils.neptune_utils import NeptuneSummaryWriter
-
                 self.writer = NeptuneSummaryWriter(log_dir=self.log_dir, flush_secs=10, cfg=self.cfg)
                 self.writer.log_config(self.env.cfg, self.cfg, self.alg_cfg, self.policy_cfg)
             elif self.logger_type == "wandb":
                 from rsl_rl.utils.wandb_utils import WandbSummaryWriter
-
                 self.writer = WandbSummaryWriter(log_dir=self.log_dir, flush_secs=10, cfg=self.cfg)
                 self.writer.log_config(self.env.cfg, self.cfg, self.alg_cfg, self.policy_cfg)
             elif self.logger_type == "tensorboard":
                 from torch.utils.tensorboard import SummaryWriter
-
                 self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
             else:
                 raise ValueError("Logger type not found. Please choose 'neptune', 'wandb' or 'tensorboard'.")
 
-        # check if teacher is loaded
+        # ====== 2. 如果是蒸馏模式，检查 Teacher（专家策略）模型是否已加载 ======
         if self.training_type == "distillation" and not self.alg.policy.loaded_teacher:
             raise ValueError("Teacher model parameters not loaded. Please load a teacher model to distill.")
 
-        # randomize initial episode lengths (for exploration)
+        # ====== 3. 随机化初始步数（解决集体超时重置问题，平滑数据分布） ======
         if init_at_random_ep_len:
             self.env.episode_length_buf = torch.randint_like(
                 self.env.episode_length_buf, high=int(self.env.max_episode_length)
             )
 
-        # start learning
+        # ====== 4. 获取环境的第一帧初始观测，并设置为训练模式 ======
         obs, extras = self.env.get_observations()
         privileged_obs = extras["observations"].get(self.privileged_obs_type, obs)
         obs, privileged_obs = obs.to(self.device), privileged_obs.to(self.device)
-        self.train_mode()  # switch to train mode (for dropout for example)
+        self.train_mode()  # 激活训练状态，例如开启 Dropout
 
-        # Book keeping
+        # ====== 5. 实例化临时统计缓存，记录最近 100 个 Episode 的均值 ======
         ep_infos = []
-        rewbuffer = deque(maxlen=100)
-        lenbuffer = deque(maxlen=100)
-        cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
-        cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+        rewbuffer = deque(maxlen=100)  # 保存最近 100 个回合的累计奖励
+        lenbuffer = deque(maxlen=100)  # 保存最近 100 个回合的生存步数
+        cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)     # 当前回合累计奖励
+        cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device) # 当前回合累计生存步数
 
-        # create buffers for logging extrinsic and intrinsic rewards
+        # 如果开启了 RND 好奇心模块，额外初始化内在奖励与外在奖励的统计缓存
         if self.alg.rnd:
             erewbuffer = deque(maxlen=100)
             irewbuffer = deque(maxlen=100)
             cur_ereward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
             cur_ireward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
 
-        # Ensure all parameters are in-synced
+        # ====== 6. 多卡分布式训练参数广播与同步 ======
         if self.is_distributed:
             print(f"Synchronizing parameters for rank {self.gpu_global_rank}...")
-            self.alg.broadcast_parameters()
-            # TODO: Do we need to synchronize empirical normalizers?
-            #   Right now: No, because they all should converge to the same values "asymptotically".
+            self.alg.broadcast_parameters()  # 强行同步所有卡上的模型初始权重
 
-        # Start training
+        # ====== 7. 开启训练更新迭代大循环 ======
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
         for it in range(start_iter, tot_iter):
             start = time.time()
-            # Rollout
+            
+            # ------ A. Rollout 采样交互阶段：不计算梯度以提升采样效率 ------
             with torch.inference_mode():
-                for _ in range(self.num_steps_per_env):
-                    # Sample actions
+                for _ in range(self.num_steps_per_env):  # 采样定长轨迹（通常为 24 步）
+                    # 1. 策略前向传播，决定动作动作
                     actions = self.alg.act(obs, privileged_obs)
-                    # Step the environment
+                    # 2. 将动作传入物理仿真器前进一步，获取新观测值与重置信号
                     obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
-                    # Move to device
+                    
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
-                    # perform normalization
+                    
+                    # 3. 如果需要，对输入观测值进行在线均值-方差归一化
                     obs = self.obs_normalizer(obs)
                     if self.privileged_obs_type is not None:
                         privileged_obs = self.privileged_obs_normalizer(
@@ -229,35 +225,37 @@ class OnPolicyRunner:
                     else:
                         privileged_obs = obs
 
-                    # process the step
+                    # 4. 将交互数据写入 RolloutStorage 缓存，并记录状态评分 V(s) 和 log_prob
                     self.alg.process_env_step(rewards, dones, infos)
 
-                    # Extract intrinsic rewards (only for logging)
+                    # 5. 提取内在好奇心奖励用于统计
                     intrinsic_rewards = self.alg.intrinsic_rewards if self.alg.rnd else None
 
-                    # book keeping
+                    # 6. 统计当前时间步环境中的各项奖励指标与生命周期
                     if self.log_dir is not None:
                         if "episode" in infos:
                             ep_infos.append(infos["episode"])
                         elif "log" in infos:
                             ep_infos.append(infos["log"])
-                        # Update rewards
+                        
+                        # 累计本回合总奖励
                         if self.alg.rnd:
                             cur_ereward_sum += rewards
                             cur_ireward_sum += intrinsic_rewards  # type: ignore
                             cur_reward_sum += rewards + intrinsic_rewards
                         else:
                             cur_reward_sum += rewards
-                        # Update episode length
                         cur_episode_length += 1
-                        # Clear data for completed episodes
-                        # -- common
+                        
+                        # 检测有哪些并行环境触及了 Dones（摔倒或超时）
                         new_ids = (dones > 0).nonzero(as_tuple=False)
+                        # 将这些刚完成的回合最终数据压入日志队列
                         rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
                         lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
+                        # 重置已完成环境的计数器
                         cur_reward_sum[new_ids] = 0
                         cur_episode_length[new_ids] = 0
-                        # -- intrinsic and extrinsic rewards
+                        
                         if self.alg.rnd:
                             erewbuffer.extend(cur_ereward_sum[new_ids][:, 0].cpu().numpy().tolist())
                             irewbuffer.extend(cur_ireward_sum[new_ids][:, 0].cpu().numpy().tolist())
@@ -265,39 +263,40 @@ class OnPolicyRunner:
                             cur_ireward_sum[new_ids] = 0
 
                 stop = time.time()
-                collection_time = stop - start
+                collection_time = stop - start  # 采样数据消耗的总耗时
                 start = stop
 
-                # compute returns
+                # ------ B. 优势计算阶段 ------
+                # 调用 RolloutStorage 自带的 GAE 计算器，从后向前倒序计算折扣回报与优势估计值
                 if self.training_type == "rl":
                     self.alg.compute_returns(privileged_obs)
 
-            # update policy
+            # ------ C. 神经网络优化阶段：激活梯度计算并更新策略 ------
+            # 自动进行 Mini-Batch 切分，计算 PPO 的 Actor & Critic Loss，并反向传播更新参数
             loss_dict = self.alg.update()
 
             stop = time.time()
-            learn_time = stop - start
+            learn_time = stop - start  # 参数优化更新耗时
             self.current_learning_iteration = it
-            # log info
+            
+            # ------ D. 日志输出与定期存盘 ------
             if self.log_dir is not None and not self.disable_logs:
-                # Log information
+                # 记录控制台打印与 TensorBoard 折线图
                 self.log(locals())
-                # Save model
+                # 定期保存神经网络模型 checkpoint
                 if it % self.save_interval == 0:
                     self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
 
-            # Clear episode infos
             ep_infos.clear()
-            # Save code state
+            
+            # 在首轮更新时备份当前的 git 代码修改状态，极大增加实验可复现性
             if it == start_iter and not self.disable_logs:
-                # obtain all the diff files
                 git_file_paths = store_code_state(self.log_dir, self.git_status_repos)
-                # if possible store them to wandb
                 if self.logger_type in ["wandb", "neptune"] and git_file_paths:
                     for path in git_file_paths:
                         self.writer.save_file(path)
 
-        # Save the final model after training
+        # ====== 8. 训练结束后，保存最终训练完成的模型 ======
         if self.log_dir is not None and not self.disable_logs:
             self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
 

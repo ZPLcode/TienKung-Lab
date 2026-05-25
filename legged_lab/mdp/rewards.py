@@ -32,41 +32,75 @@ if TYPE_CHECKING:
 
 
 def track_lin_vel_xy_yaw_frame_exp(
-    env: BaseEnv | TienKungEnv, std: float, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+    env: BaseEnv | TienKungEnv,
+    std: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
+    """
+    计算底盘在水平面（X-Y 轴）内线速度的跟踪奖励，采用指数衰减形式。
+    """
+    # ====== 1. 从环境场景中获取机器人的 Articulation（多关节刚体）对象 ======
     asset: Articulation = env.scene[asset_cfg.name]
+
+    # ====== 2. 计算航向坐标系（Yaw Frame）下的线速度 ======
+    # 2.1 math_utils.yaw_quat(asset.data.root_quat_w)：从机器人世界坐标系的姿态四元数中，提取出纯偏航角（Yaw，即水平朝向），过滤掉 Roll/Pitch（身体倾斜）
+    # 2.2 asset.data.root_lin_vel_w[:, :3]：机器人在世界坐标系下的三维线速度矢量
+    # 2.3 quat_rotate_inverse(...)：将世界系下的速度投影到仅含偏航角的航向系下。这样可以避免机器人身体晃动（俯仰/横滚）干扰对水平运动速度的测量
     vel_yaw = math_utils.quat_rotate_inverse(
         math_utils.yaw_quat(asset.data.root_quat_w), asset.data.root_lin_vel_w[:, :3]
     )
-    lin_vel_error = torch.sum(torch.square(env.command_generator.command[:, :2] - vel_yaw[:, :2]), dim=1)
+
+    # ====== 3. 计算期望速度与实际速度的误差平方和 ======
+    # 计算公式：(目标_vx - 实际_vx)^2 + (目标_vy - 实际_vy)^2
+    lin_vel_error = torch.sum(
+        torch.square(env.command_generator.command[:, :2] - vel_yaw[:, :2]), dim=1
+    )
+
+    # ====== 4. 计算并返回指数形式的奖励值 ======
+    # 使用公式 R = exp(-误差 / std^2)，使得误差为 0 时奖励为 1.0，误差极大时奖励平滑衰减趋近于 0
+    # 参数 std (标准差，这里设为 0.5) 决定了对速度误差的容忍度，值越小对跟踪精度的要求越严苛
     return torch.exp(-lin_vel_error / std**2)
 
 
 def track_ang_vel_z_world_exp(
-    env: BaseEnv | TienKungEnv, std: float, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+    env: BaseEnv | TienKungEnv,
+    std: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     asset: Articulation = env.scene[asset_cfg.name]
-    ang_vel_error = torch.square(env.command_generator.command[:, 2] - asset.data.root_ang_vel_w[:, 2])
+    ang_vel_error = torch.square(
+        env.command_generator.command[:, 2] - asset.data.root_ang_vel_w[:, 2]
+    )
     return torch.exp(-ang_vel_error / std**2)
 
 
-def lin_vel_z_l2(env: BaseEnv | TienKungEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+def lin_vel_z_l2(
+    env: BaseEnv | TienKungEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
     asset: Articulation = env.scene[asset_cfg.name]
     return torch.square(asset.data.root_lin_vel_b[:, 2])
 
 
-def ang_vel_xy_l2(env: BaseEnv | TienKungEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+def ang_vel_xy_l2(
+    env: BaseEnv | TienKungEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
     asset: Articulation = env.scene[asset_cfg.name]
     return torch.sum(torch.square(asset.data.root_ang_vel_b[:, :2]), dim=1)
 
 
-def energy(env: BaseEnv | TienKungEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+def energy(
+    env: BaseEnv | TienKungEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
     asset: Articulation = env.scene[asset_cfg.name]
-    reward = torch.norm(torch.abs(asset.data.applied_torque * asset.data.joint_vel), dim=-1)
+    reward = torch.norm(
+        torch.abs(asset.data.applied_torque * asset.data.joint_vel), dim=-1
+    )
     return reward
 
 
-def joint_acc_l2(env: BaseEnv | TienKungEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+def joint_acc_l2(
+    env: BaseEnv | TienKungEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
     asset: Articulation = env.scene[asset_cfg.name]
     return torch.sum(torch.square(asset.data.joint_acc[:, asset_cfg.joint_ids]), dim=1)
 
@@ -74,23 +108,38 @@ def joint_acc_l2(env: BaseEnv | TienKungEnv, asset_cfg: SceneEntityCfg = SceneEn
 def action_rate_l2(env: BaseEnv | TienKungEnv) -> torch.Tensor:
     return torch.sum(
         torch.square(
-            env.action_buffer._circular_buffer.buffer[:, -1, :] - env.action_buffer._circular_buffer.buffer[:, -2, :]
+            env.action_buffer._circular_buffer.buffer[:, -1, :]
+            - env.action_buffer._circular_buffer.buffer[:, -2, :]
         ),
         dim=1,
     )
 
 
-def undesired_contacts(env: BaseEnv | TienKungEnv, threshold: float, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
+def undesired_contacts(
+    env: BaseEnv | TienKungEnv, threshold: float, sensor_cfg: SceneEntityCfg
+) -> torch.Tensor:
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
     net_contact_forces = contact_sensor.data.net_forces_w_history
-    is_contact = torch.max(torch.norm(net_contact_forces[:, :, sensor_cfg.body_ids], dim=-1), dim=1)[0] > threshold
+    is_contact = (
+        torch.max(
+            torch.norm(net_contact_forces[:, :, sensor_cfg.body_ids], dim=-1), dim=1
+        )[0]
+        > threshold
+    )
     return torch.sum(is_contact, dim=1)
 
 
-def fly(env: BaseEnv | TienKungEnv, threshold: float, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
+def fly(
+    env: BaseEnv | TienKungEnv, threshold: float, sensor_cfg: SceneEntityCfg
+) -> torch.Tensor:
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
     net_contact_forces = contact_sensor.data.net_forces_w_history
-    is_contact = torch.max(torch.norm(net_contact_forces[:, :, sensor_cfg.body_ids], dim=-1), dim=1)[0] > threshold
+    is_contact = (
+        torch.max(
+            torch.norm(net_contact_forces[:, :, sensor_cfg.body_ids], dim=-1), dim=1
+        )[0]
+        > threshold
+    )
     return torch.sum(is_contact, dim=-1) < 0.5
 
 
@@ -115,20 +164,30 @@ def feet_air_time_positive_biped(
     in_contact = contact_time > 0.0
     in_mode_time = torch.where(in_contact, contact_time, air_time)
     single_stance = torch.sum(in_contact.int(), dim=1) == 1
-    reward = torch.min(torch.where(single_stance.unsqueeze(-1), in_mode_time, 0.0), dim=1)[0]
+    reward = torch.min(
+        torch.where(single_stance.unsqueeze(-1), in_mode_time, 0.0), dim=1
+    )[0]
     reward = torch.clamp(reward, max=threshold)
     # no reward for zero command
     reward *= (
-        torch.norm(env.command_generator.command[:, :2], dim=1) + torch.abs(env.command_generator.command[:, 2])
+        torch.norm(env.command_generator.command[:, :2], dim=1)
+        + torch.abs(env.command_generator.command[:, 2])
     ) > 0.1
     return reward
 
 
 def feet_slide(
-    env: BaseEnv | TienKungEnv, sensor_cfg: SceneEntityCfg, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+    env: BaseEnv | TienKungEnv,
+    sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
-    contacts = contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :].norm(dim=-1).max(dim=1)[0] > 1.0
+    contacts = (
+        contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :]
+        .norm(dim=-1)
+        .max(dim=1)[0]
+        > 1.0
+    )
     asset: Articulation = env.scene[asset_cfg.name]
     body_vel = asset.data.body_lin_vel_w[:, asset_cfg.body_ids, :2]
     reward = torch.sum(body_vel.norm(dim=-1) * contacts, dim=1)
@@ -136,7 +195,10 @@ def feet_slide(
 
 
 def body_force(
-    env: BaseEnv | TienKungEnv, sensor_cfg: SceneEntityCfg, threshold: float = 500, max_reward: float = 400
+    env: BaseEnv | TienKungEnv,
+    sensor_cfg: SceneEntityCfg,
+    threshold: float = 500,
+    max_reward: float = 400,
 ) -> torch.Tensor:
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
     reward = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, 2].norm(dim=-1)
@@ -146,11 +208,17 @@ def body_force(
     return reward
 
 
-def joint_deviation_l1(env: BaseEnv | TienKungEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+def joint_deviation_l1(
+    env: BaseEnv | TienKungEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
     asset: Articulation = env.scene[asset_cfg.name]
-    angle = asset.data.joint_pos[:, asset_cfg.joint_ids] - asset.data.default_joint_pos[:, asset_cfg.joint_ids]
+    angle = (
+        asset.data.joint_pos[:, asset_cfg.joint_ids]
+        - asset.data.default_joint_pos[:, asset_cfg.joint_ids]
+    )
     zero_flag = (
-        torch.norm(env.command_generator.command[:, :2], dim=1) + torch.abs(env.command_generator.command[:, 2])
+        torch.norm(env.command_generator.command[:, :2], dim=1)
+        + torch.abs(env.command_generator.command[:, 2])
     ) < 0.1
     return torch.sum(torch.abs(angle), dim=1) * zero_flag
 
@@ -165,7 +233,9 @@ def body_orientation_l2(
     return torch.sum(torch.square(body_orientation[:, :2]), dim=1)
 
 
-def feet_stumble(env: BaseEnv | TienKungEnv, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
+def feet_stumble(
+    env: BaseEnv | TienKungEnv, sensor_cfg: SceneEntityCfg
+) -> torch.Tensor:
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
     return torch.any(
         torch.norm(contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :2], dim=2)
@@ -175,7 +245,9 @@ def feet_stumble(env: BaseEnv | TienKungEnv, sensor_cfg: SceneEntityCfg) -> torc
 
 
 def feet_too_near_humanoid(
-    env: BaseEnv | TienKungEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"), threshold: float = 0.2
+    env: BaseEnv | TienKungEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    threshold: float = 0.2,
 ) -> torch.Tensor:
     assert len(asset_cfg.body_ids) == 2
     asset: Articulation = env.scene[asset_cfg.name]
@@ -187,7 +259,9 @@ def feet_too_near_humanoid(
 # Regularization Reward
 def ankle_torque(env: TienKungEnv) -> torch.Tensor:
     """Penalize large torques on the ankle joints."""
-    return torch.sum(torch.square(env.robot.data.applied_torque[:, env.ankle_joint_ids]), dim=1)
+    return torch.sum(
+        torch.square(env.robot.data.applied_torque[:, env.ankle_joint_ids]), dim=1
+    )
 
 
 def ankle_action(env: TienKungEnv) -> torch.Tensor:
@@ -197,20 +271,34 @@ def ankle_action(env: TienKungEnv) -> torch.Tensor:
 
 def hip_roll_action(env: TienKungEnv) -> torch.Tensor:
     """Penalize hip roll joint actions."""
-    return torch.sum(torch.abs(env.action[:, [env.left_leg_ids[0], env.right_leg_ids[0]]]), dim=1)
+    return torch.sum(
+        torch.abs(env.action[:, [env.left_leg_ids[0], env.right_leg_ids[0]]]), dim=1
+    )
 
 
 def hip_yaw_action(env: TienKungEnv) -> torch.Tensor:
     """Penalize hip yaw joint actions."""
-    return torch.sum(torch.abs(env.action[:, [env.left_leg_ids[2], env.right_leg_ids[2]]]), dim=1)
+    return torch.sum(
+        torch.abs(env.action[:, [env.left_leg_ids[2], env.right_leg_ids[2]]]), dim=1
+    )
 
 
 def feet_y_distance(env: TienKungEnv) -> torch.Tensor:
     """Penalize foot y-distance when the commanded y-velocity is low, to maintain a reasonable spacing."""
-    leftfoot = env.robot.data.body_pos_w[:, env.feet_body_ids[0], :] - env.robot.data.root_link_pos_w[:, :]
-    rightfoot = env.robot.data.body_pos_w[:, env.feet_body_ids[1], :] - env.robot.data.root_link_pos_w[:, :]
-    leftfoot_b = math_utils.quat_apply(math_utils.quat_conjugate(env.robot.data.root_link_quat_w[:, :]), leftfoot)
-    rightfoot_b = math_utils.quat_apply(math_utils.quat_conjugate(env.robot.data.root_link_quat_w[:, :]), rightfoot)
+    leftfoot = (
+        env.robot.data.body_pos_w[:, env.feet_body_ids[0], :]
+        - env.robot.data.root_link_pos_w[:, :]
+    )
+    rightfoot = (
+        env.robot.data.body_pos_w[:, env.feet_body_ids[1], :]
+        - env.robot.data.root_link_pos_w[:, :]
+    )
+    leftfoot_b = math_utils.quat_apply(
+        math_utils.quat_conjugate(env.robot.data.root_link_quat_w[:, :]), leftfoot
+    )
+    rightfoot_b = math_utils.quat_apply(
+        math_utils.quat_conjugate(env.robot.data.root_link_quat_w[:, :]), rightfoot
+    )
     y_distance_b = torch.abs(leftfoot_b[:, 1] - rightfoot_b[:, 1] - 0.299)
     y_vel_flag = torch.abs(env.command_generator.command[:, 1]) < 0.1
     return y_distance_b * y_vel_flag
@@ -269,26 +357,52 @@ def gait_clock(phase, air_ratio, delta_t):
 
 def gait_feet_frc_perio(env: TienKungEnv, delta_t: float = 0.02) -> torch.Tensor:
     """Penalize foot force during the swing phase of the gait."""
-    left_frc_swing_mask = gait_clock(env.gait_phase[:, 0], env.phase_ratio[:, 0], delta_t)[0]
-    right_frc_swing_mask = gait_clock(env.gait_phase[:, 1], env.phase_ratio[:, 1], delta_t)[0]
-    left_frc_score = left_frc_swing_mask * (torch.exp(-200 * torch.square(env.avg_feet_force_per_step[:, 0])))
-    right_frc_score = right_frc_swing_mask * (torch.exp(-200 * torch.square(env.avg_feet_force_per_step[:, 1])))
+    left_frc_swing_mask = gait_clock(
+        env.gait_phase[:, 0], env.phase_ratio[:, 0], delta_t
+    )[0]
+    right_frc_swing_mask = gait_clock(
+        env.gait_phase[:, 1], env.phase_ratio[:, 1], delta_t
+    )[0]
+    left_frc_score = left_frc_swing_mask * (
+        torch.exp(-200 * torch.square(env.avg_feet_force_per_step[:, 0]))
+    )
+    right_frc_score = right_frc_swing_mask * (
+        torch.exp(-200 * torch.square(env.avg_feet_force_per_step[:, 1]))
+    )
     return left_frc_score + right_frc_score
 
 
 def gait_feet_spd_perio(env: TienKungEnv, delta_t: float = 0.02) -> torch.Tensor:
     """Penalize foot speed during the support phase of the gait."""
-    left_spd_support_mask = gait_clock(env.gait_phase[:, 0], env.phase_ratio[:, 0], delta_t)[1]
-    right_spd_support_mask = gait_clock(env.gait_phase[:, 1], env.phase_ratio[:, 1], delta_t)[1]
-    left_spd_score = left_spd_support_mask * (torch.exp(-100 * torch.square(env.avg_feet_speed_per_step[:, 0])))
-    right_spd_score = right_spd_support_mask * (torch.exp(-100 * torch.square(env.avg_feet_speed_per_step[:, 1])))
+    left_spd_support_mask = gait_clock(
+        env.gait_phase[:, 0], env.phase_ratio[:, 0], delta_t
+    )[1]
+    right_spd_support_mask = gait_clock(
+        env.gait_phase[:, 1], env.phase_ratio[:, 1], delta_t
+    )[1]
+    left_spd_score = left_spd_support_mask * (
+        torch.exp(-100 * torch.square(env.avg_feet_speed_per_step[:, 0]))
+    )
+    right_spd_score = right_spd_support_mask * (
+        torch.exp(-100 * torch.square(env.avg_feet_speed_per_step[:, 1]))
+    )
     return left_spd_score + right_spd_score
 
 
-def gait_feet_frc_support_perio(env: TienKungEnv, delta_t: float = 0.02) -> torch.Tensor:
+def gait_feet_frc_support_perio(
+    env: TienKungEnv, delta_t: float = 0.02
+) -> torch.Tensor:
     """Reward that promotes proper support force during stance (support) phase."""
-    left_frc_support_mask = gait_clock(env.gait_phase[:, 0], env.phase_ratio[:, 0], delta_t)[1]
-    right_frc_support_mask = gait_clock(env.gait_phase[:, 1], env.phase_ratio[:, 1], delta_t)[1]
-    left_frc_score = left_frc_support_mask * (1 - torch.exp(-10 * torch.square(env.avg_feet_force_per_step[:, 0])))
-    right_frc_score = right_frc_support_mask * (1 - torch.exp(-10 * torch.square(env.avg_feet_force_per_step[:, 1])))
+    left_frc_support_mask = gait_clock(
+        env.gait_phase[:, 0], env.phase_ratio[:, 0], delta_t
+    )[1]
+    right_frc_support_mask = gait_clock(
+        env.gait_phase[:, 1], env.phase_ratio[:, 1], delta_t
+    )[1]
+    left_frc_score = left_frc_support_mask * (
+        1 - torch.exp(-10 * torch.square(env.avg_feet_force_per_step[:, 0]))
+    )
+    right_frc_score = right_frc_support_mask * (
+        1 - torch.exp(-10 * torch.square(env.avg_feet_force_per_step[:, 1]))
+    )
     return left_frc_score + right_frc_score

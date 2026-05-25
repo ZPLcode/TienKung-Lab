@@ -46,39 +46,51 @@ class ActorCritic(nn.Module):
                 + str([key for key in kwargs.keys()])
             )
         super().__init__()
+        # 解析并实例化激活函数（通常是 nn.ELU）
         activation = resolve_nn_activation(activation)
 
         mlp_input_dim_a = num_actor_obs
         mlp_input_dim_c = num_critic_obs
-        # Policy
+        
+        # ====== 1. 构建 Actor 神经网络（策略网络，计算动作均值 Mean） ======
         actor_layers = []
+        # 输入层：从单步观测特征维度（例如 750）映射到第一个隐藏层维度
         actor_layers.append(nn.Linear(mlp_input_dim_a, actor_hidden_dims[0]))
         actor_layers.append(activation)
+        # 中间隐藏层循环搭建
         for layer_index in range(len(actor_hidden_dims)):
             if layer_index == len(actor_hidden_dims) - 1:
+                # 输出层：从最后一个隐藏层映射到动作数量（例如 20维，代表各关节的目标偏置）
                 actor_layers.append(nn.Linear(actor_hidden_dims[layer_index], num_actions))
             else:
                 actor_layers.append(nn.Linear(actor_hidden_dims[layer_index], actor_hidden_dims[layer_index + 1]))
                 actor_layers.append(activation)
+        # 用 nn.Sequential 包装成一个顺序执行的模型
         self.actor = nn.Sequential(*actor_layers)
 
-        # Value function
+        # ====== 2. 构建 Critic 神经网络（价值评估网络，计算当前状态评分 Value） ======
         critic_layers = []
+        # 输入层：从特权观测维度（例如 800）映射到第一个隐藏层维度
         critic_layers.append(nn.Linear(mlp_input_dim_c, critic_hidden_dims[0]))
         critic_layers.append(activation)
+        # 中间隐藏层循环搭建
         for layer_index in range(len(critic_hidden_dims)):
             if layer_index == len(critic_hidden_dims) - 1:
+                # 输出层：输出一个标量数值（1维），即当前状态的价值期望 V(s)
                 critic_layers.append(nn.Linear(critic_hidden_dims[layer_index], 1))
             else:
                 critic_layers.append(nn.Linear(critic_hidden_dims[layer_index], critic_hidden_dims[layer_index + 1]))
                 critic_layers.append(activation)
+        # 同样包装成顺序执行模型
         self.critic = nn.Sequential(*critic_layers)
 
         print(f"Actor MLP: {self.actor}")
         print(f"Critic MLP: {self.critic}")
 
-        # Action noise
+        # ====== 3. 动作探索噪声（Action Noise，控制策略的随机探索程度） ======
+        # 在 PPO 中，Actor 输出动作的均值 Mean，同时需要标准差 Std 来构建正态分布进行随机采样
         self.noise_std_type = noise_std_type
+        # 将标准差（或对数标准差）作为 PyTorch 可学习参数 (nn.Parameter)，随着训练进行会自动减小（收敛）
         if self.noise_std_type == "scalar":
             self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
         elif self.noise_std_type == "log":
@@ -86,9 +98,9 @@ class ActorCritic(nn.Module):
         else:
             raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
 
-        # Action distribution (populated in update_distribution)
+        # 动作采样分布（将在 update_distribution 步骤中实例化）
         self.distribution = None
-        # disable args validation for speedup
+        # 禁用 PyTorch 对正态分布参数的范围校验，以获得更快的运行速度
         Normal.set_default_validate_args(False)
 
     @staticmethod
@@ -118,20 +130,29 @@ class ActorCritic(nn.Module):
         return self.distribution.entropy().sum(dim=-1)
 
     def update_distribution(self, observations):
-        # compute mean
+        # ====== 1. 前向传播计算动作均值 (Mean) ======
+        # 将当前环境观测输入 Actor 多层感知机 (MLP)，预测当前状态下的期望最优动作
         mean = self.actor(observations)
-        # compute standard deviation
+        
+        # ====== 2. 解析探索噪声标准差 (Standard Deviation) ======
         if self.noise_std_type == "scalar":
+            # 如果是标量模式，直接把预设的固定标准差 std 扩展到与 mean 相同的形状 (num_envs, num_actions)
             std = self.std.expand_as(mean)
         elif self.noise_std_type == "log":
+            # 如果是对数模式（防止梯度更新使得标准差变为负值），通过指数变换 torch.exp 得到实际标准差，再进行形状扩展
             std = torch.exp(self.log_std).expand_as(mean)
         else:
             raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
-        # create distribution
+            
+        # ====== 3. 实例化多维独立正态分布对象 ======
+        # 以预测的 mean 为中心，以 std 为偏差大小，构造高斯分布，供后续动作采样和对数概率计算使用
         self.distribution = Normal(mean, std)
 
     def act(self, observations, **kwargs):
+        # ====== 4. 执行动作采样 ======
+        # 4.1 根据当前状态观测，更新动作的高斯分布
         self.update_distribution(observations)
+        # 4.2 从分布中随机采样出一个动作返回。这种带有噪声的采样就是强化学习的“探索 (Exploration)”机制
         return self.distribution.sample()
 
     def get_actions_log_prob(self, actions):

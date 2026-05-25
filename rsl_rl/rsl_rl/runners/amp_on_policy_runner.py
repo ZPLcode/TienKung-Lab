@@ -172,7 +172,7 @@ class AmpOnPolicyRunner:
         self.git_status_repos = [rsl_rl.__file__]
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):  # noqa: C901
-        # initialize writer
+        # ====== 1. 初始化日志记录器 (Tensorboard, Wandb 或 Neptune) ======
         if self.log_dir is not None and self.writer is None and not self.disable_logs:
             # Launch either Tensorboard or Neptune & Tensorboard summary writer(s), default: Tensorboard.
             self.logger_type = self.cfg.get("logger", "tensorboard")
@@ -195,24 +195,24 @@ class AmpOnPolicyRunner:
             else:
                 raise ValueError("Logger type not found. Please choose 'neptune', 'wandb' or 'tensorboard'.")
 
-        # check if teacher is loaded
+        # ====== 2. 如果是蒸馏模式，检查 Teacher（专家策略）模型是否已加载 ======
         if self.training_type == "distillation" and not self.alg.policy.loaded_teacher:
             raise ValueError("Teacher model parameters not loaded. Please load a teacher model to distill.")
 
-        # randomize initial episode lengths (for exploration)
+        # ====== 3. 随机化初始步数（解决本时刻全员超时重置问题，平滑数据分布） ======
         if init_at_random_ep_len:
             self.env.episode_length_buf = torch.randint_like(
                 self.env.episode_length_buf, high=int(self.env.max_episode_length)
             )
 
-        # start learning
+        # ====== 4. 获取环境的初始观测值（额外获取 AMP 动捕比对观测值 amp_obs） ======
         obs, extras = self.env.get_observations()
         privileged_obs = extras["observations"].get(self.privileged_obs_type, obs)
         amp_obs = self.env.get_amp_obs_for_expert_trans()
         obs, privileged_obs, amp_obs = obs.to(self.device), privileged_obs.to(self.device), amp_obs.to(self.device)
         self.train_mode()  # switch to train mode (for dropout for example)
 
-        # Book keeping
+        # ====== 5. 实例化临时统计缓存，记录最近 100 个 Episode 的均值 ======
         ep_infos = []
         rewbuffer = deque(maxlen=100)
         lenbuffer = deque(maxlen=100)
@@ -226,24 +226,24 @@ class AmpOnPolicyRunner:
             cur_ereward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
             cur_ireward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
 
-        # Ensure all parameters are in-synced
+        # ====== 6. 多卡分布式训练参数广播与同步 ======
         if self.is_distributed:
             print(f"Synchronizing parameters for rank {self.gpu_global_rank}...")
             self.alg.broadcast_parameters()
             # TODO: Do we need to synchronize empirical normalizers?
             #   Right now: No, because they all should converge to the same values "asymptotically".
 
-        # Start training
+        # ====== 7. 开启训练更新迭代大循环 ======
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
         for it in range(start_iter, tot_iter):
             start = time.time()
-            # Rollout
+            # ------ A. Rollout 采样交互阶段：不计算梯度以提升采样效率 ------
             with torch.inference_mode():
                 for _ in range(self.num_steps_per_env):
-                    # Sample actions
+                    # 1. 策略前向传播，决定动作。这里传入了额外的 amp_obs 动捕观测
                     actions = self.alg.act(obs, privileged_obs, amp_obs)
-                    # Step the environment
+                    # 2. 将动作传入物理仿真器前进一步，获取新观测值与重置信号
                     obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
                     next_amp_obs = self.env.get_amp_obs_for_expert_trans()
                     # Move to device
@@ -253,7 +253,7 @@ class AmpOnPolicyRunner:
                         dones.to(self.device),
                         next_amp_obs.to(self.device),
                     )
-                    # perform normalization
+                    # 3. 对输入观测值进行在线均值-方差归一化
                     obs = self.obs_normalizer(obs)
                     if self.privileged_obs_type is not None:
                         privileged_obs = self.privileged_obs_normalizer(
@@ -262,16 +262,21 @@ class AmpOnPolicyRunner:
                     else:
                         privileged_obs = obs
 
-                    # Account for terminal state transitions
+                    # 4. 特殊处理终止（Reset）环境的 AMP 观测过渡态：
+                    #    如果环境重置了，其原本的 next_amp_obs 会直接跳转到新回合的初始姿态。
+                    #    为了计算上一步动作的拟真度，我们需要将重置环境的 next_amp_obs 强行覆盖为“倒地/死亡前的最后一帧”实际终态。
                     next_amp_obs_with_term = torch.clone(next_amp_obs)
                     reset_env_ids = self.env.reset_env_ids
                     terminal_amp_states = self.env.get_amp_obs_for_expert_trans()[reset_env_ids]
                     next_amp_obs_with_term[reset_env_ids] = terminal_amp_states
 
+                    # 5. 【AMP 核心逻辑】使用鉴别器网络评估当前转换的拟真度，生成对抗风格奖励，并与任务奖励融合
                     rewards = self.alg.discriminator.predict_amp_reward(
                         amp_obs, next_amp_obs_with_term, rewards, normalizer=self.alg.amp_normalizer
                     )[0]
                     amp_obs = torch.clone(next_amp_obs)
+                    
+                    # 6. 将包含 AMP 状态的数据包存入 RolloutStorage
                     self.alg.process_env_step(rewards, dones, infos, next_amp_obs_with_term)
 
                     # Extract intrinsic rewards (only for logging)
@@ -310,17 +315,20 @@ class AmpOnPolicyRunner:
                 collection_time = stop - start
                 start = stop
 
-                # compute returns
+                # ------ B. 优势计算阶段 ------
+                # 调用 RolloutStorage 自带的 GAE 计算器，从后向前倒序计算折扣回报与优势估计值
                 if self.training_type == "rl":
                     self.alg.compute_returns(privileged_obs)
 
-            # update policy
+            # ------ C. 神经网络优化阶段：激活梯度计算并更新策略 ------
+            # 自动进行 Mini-Batch 切分，计算并反向传播更新 Actor、Critic 以及 AMP 鉴别器网络的权重参数
             loss_dict = self.alg.update()
 
             stop = time.time()
             learn_time = stop - start
             self.current_learning_iteration = it
-            # log info
+            
+            # ------ D. 日志输出与定期存盘 ------
             if self.log_dir is not None and not self.disable_logs:
                 # Log information
                 self.log(locals())
@@ -339,7 +347,7 @@ class AmpOnPolicyRunner:
                     for path in git_file_paths:
                         self.writer.save_file(path)
 
-        # Save the final model after training
+        # ====== 8. 训练结束后，保存最终训练完成的模型 ======
         if self.log_dir is not None and not self.disable_logs:
             self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
 

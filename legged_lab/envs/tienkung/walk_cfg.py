@@ -62,13 +62,36 @@ class GaitCfg:
 
 @configclass
 class LiteRewardCfg:
+    # ====== 1. 任务指标跟踪奖励（正权重） ======
+    # 1.1 底盘线速度跟踪奖励：利用指数函数，鼓励机器人的横向和纵向速度完美跟上目标摇杆指令
     track_lin_vel_xy_exp = RewTerm(func=mdp.track_lin_vel_xy_yaw_frame_exp, weight=1.0, params={"std": 0.5})
+    # 1.2 旋转角速度跟踪奖励：鼓励机器人偏航角速度（绕 z 轴自转）完美跟上自转指令
     track_ang_vel_z_exp = RewTerm(func=mdp.track_ang_vel_z_world_exp, weight=1.0, params={"std": 0.5})
+
+    # ====== 2. 机身姿态稳定惩罚（负权重） ======
+    # 2.1 垂直线速度惩罚：惩罚机身在垂直 z 方向上的上下多余窜动，防止蹦跳，使行走更平稳
     lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-1.0)
+    # 2.2 横滚/俯仰角速度惩罚：惩罚身体绕 x 和 y 轴的多余晃动，防止机器人左右扭捏和前后摇晃
     ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.05)
+    # 2.3 机身朝向（姿态）惩罚：约束骨盆（Pelvis）滚转角和俯仰角，强迫上半身必须保持直立状态
+    body_orientation_l2 = RewTerm(
+        func=mdp.body_orientation_l2, params={"asset_cfg": SceneEntityCfg("robot", body_names="pelvis")}, weight=-2.0
+    )
+    # 2.4 水平姿态稳定惩罚：进一步迫使机身维持在水平参考面上
+    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-1.0)
+
+    # ====== 3. 硬件安全性与控制平滑度惩罚（负权重） ======
+    # 3.1 能量消耗惩罚：计算关节输出机械功耗（力矩*速度），降低电池功耗，鼓励省力的经济步态
     energy = RewTerm(func=mdp.energy, weight=-1e-3)
+    # 3.2 关节加速度惩罚：惩罚关节速度的剧烈改变，防止电机过度磨损，使驱动顺滑
     dof_acc_l2 = RewTerm(func=mdp.joint_acc_l2, weight=-2.5e-7)
+    # 3.3 动作变化率惩罚：惩罚相邻两个控制周期输出动作的差值，抑制控制高频抖动（实机部署非常关键）
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.01)
+    # 3.4 关节角度极限惩罚：当关节角度逼近限位保护挡板时惩罚，引导关节在舒适角度中段活动
+    dof_pos_limits = RewTerm(func=mdp.joint_pos_limits, weight=-2.0)
+
+    # ====== 4. 触地碰撞与摔倒惩罚（负权重） ======
+    # 4.1 非预期接触惩罚：惩罚除了足部以外的部位（膝盖、躯干、肩膀等）碰地，起防摔效果
     undesired_contacts = RewTerm(
         func=mdp.undesired_contacts,
         weight=-1.0,
@@ -79,11 +102,11 @@ class LiteRewardCfg:
             "threshold": 1.0,
         },
     )
-    body_orientation_l2 = RewTerm(
-        func=mdp.body_orientation_l2, params={"asset_cfg": SceneEntityCfg("robot", body_names="pelvis")}, weight=-2.0
-    )
-    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-1.0)
+    # 4.2 死亡/摔倒惩罚：机器人摔倒重置时扣除巨额分数（-200），让神经网络产生强烈的生存欲望
     termination_penalty = RewTerm(func=mdp.is_terminated, weight=-200.0)
+
+    # ====== 5. 足部行为规范惩罚（负权重） ======
+    # 5.1 脚掌滑动（打滑）惩罚：在脚底接触地面时，惩罚脚掌与地面产生的相对水平滑动速度（防止溜冰）
     feet_slide = RewTerm(
         func=mdp.feet_slide,
         weight=-0.25,
@@ -92,6 +115,7 @@ class LiteRewardCfg:
             "asset_cfg": SceneEntityCfg("robot", body_names="ankle_roll.*"),
         },
     )
+    # 5.2 足底踩地力惩罚：当脚踩地产生的垂直撞击力过大时予以惩罚，防止机器人重重“跺脚”震碎减速器
     feet_force = RewTerm(
         func=mdp.body_force,
         weight=-3e-3,
@@ -101,17 +125,23 @@ class LiteRewardCfg:
             "max_reward": 400,
         },
     )
+    # 5.3 双脚间距过近惩罚：若两脚水平间距小于 20 厘米进行惩罚，防止交叉腿、打架或者绊倒自己
     feet_too_near = RewTerm(
         func=mdp.feet_too_near_humanoid,
         weight=-2.0,
         params={"asset_cfg": SceneEntityCfg("robot", body_names=["ankle_roll.*"]), "threshold": 0.2},
     )
+    # 5.4 足部绊倒惩罚：惩罚在摆动迈腿时突然撞击前方障碍物的动作
     feet_stumble = RewTerm(
         func=mdp.feet_stumble,
         weight=-2.0,
         params={"sensor_cfg": SceneEntityCfg("contact_sensor", body_names=["ankle_roll.*"])},
     )
-    dof_pos_limits = RewTerm(func=mdp.joint_pos_limits, weight=-2.0)
+    # 5.5 双脚 y 轴间距惩罚：惩罚两脚在宽度方向上不合适（过窄或过宽）的间距，维持标准步宽
+    feet_y_distance = RewTerm(func=mdp.feet_y_distance, weight=-2.0)
+
+    # ====== 6. 关节姿态偏差惩罚（负权重，塑形人形体态） ======
+    # 6.1 髋关节与上半身偏离默认姿态惩罚：让髋关节旋转、肩肘关节不要过度外展，保持手臂微屈贴在身体旁
     joint_deviation_hip = RewTerm(
         func=mdp.joint_deviation_l1,
         weight=-0.15,
@@ -127,11 +157,13 @@ class LiteRewardCfg:
             )
         },
     )
+    # 6.2 手臂内翻外展偏差惩罚：控制手臂的摆动幅度处于优雅自然的范围
     joint_deviation_arms = RewTerm(
         func=mdp.joint_deviation_l1,
         weight=-0.2,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=["shoulder_roll_.*_joint", "shoulder_yaw_.*_joint"])},
     )
+    # 6.3 腿部关节偏离默认姿态惩罚：保持膝关节微屈、脚踝角度中立等
     joint_deviation_legs = RewTerm(
         func=mdp.joint_deviation_l1,
         weight=-0.02,
@@ -148,15 +180,23 @@ class LiteRewardCfg:
         },
     )
 
+    # ====== 7. 周期性步态相位奖励与对齐（由时间时钟 gait_phase 驱动，核心项） ======
+    # 7.1 足底接触力周期对齐奖励：惩罚在摆动相（悬空期）受力，以及支撑相（踩地期）悬空的违规行为
     gait_feet_frc_perio = RewTerm(func=mdp.gait_feet_frc_perio, weight=1.0, params={"delta_t": 0.02})
+    # 7.2 足底线速度周期对齐奖励：惩罚在踩地支撑期间足部还有很高的速度（踩下地不能再前后滑动）
     gait_feet_spd_perio = RewTerm(func=mdp.gait_feet_spd_perio, weight=1.0, params={"delta_t": 0.02})
+    # 7.3 足部支撑相力充实奖励：鼓励在需要踩地的周期里踩出合理、饱满的支撑力
     gait_feet_frc_support_perio = RewTerm(func=mdp.gait_feet_frc_support_perio, weight=0.6, params={"delta_t": 0.02})
 
+    # ====== 8. 特定关节专项控制惩罚（负权重，防野蛮动作） ======
+    # 8.1 踝关节扭矩惩罚：约束踝关节的出力大小，防止脚踝拼命发力导致舵机发热损坏
     ankle_torque = RewTerm(func=mdp.ankle_torque, weight=-0.0005)
+    # 8.2 踝关节动作幅度惩罚：避免脚踝快速扇动导致步态滑稽
     ankle_action = RewTerm(func=mdp.ankle_action, weight=-0.001)
+    # 8.3 髋关节横滚控制惩罚：防止机器人走路时屁股过度往两边倾斜扭动
     hip_roll_action = RewTerm(func=mdp.hip_roll_action, weight=-1.0)
+    # 8.4 髋关节偏航控制惩罚：约束大腿自转的动作幅度，防止内八字和外八字
     hip_yaw_action = RewTerm(func=mdp.hip_yaw_action, weight=-1.0)
-    feet_y_distance = RewTerm(func=mdp.feet_y_distance, weight=-2.0)
 
 
 @configclass
