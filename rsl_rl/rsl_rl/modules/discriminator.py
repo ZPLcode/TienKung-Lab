@@ -139,22 +139,36 @@ class Discriminator(nn.Module):
         """
         计算 AMP 奖励：判别器给策略轨迹打分，越像专家动作得分越高。
 
+        背景概念：
+            专家（Expert）= 动捕数据（walk.txt，真人穿动捕服录的自然走路轨迹）
+            策略（Policy）= 机器人当前 Actor 网络输出的动作在仿真中产生的轨迹
+            判别器训练目标（LSGAN）：专家样本 → d=+1，策略样本 → d=-1
+
+        为什么用 LSGAN 而非传统 GAN：
+            传统 GAN 用 Sigmoid+BCE，当判别器已经很自信时（输出接近 0 或 1），
+            Sigmoid 两端梯度≈0 → 策略收不到有用的学习信号 → 训练死锁。
+            LSGAN 用裸线性输出 + MSE Loss，d ∈ (-∞,+∞)，梯度始终有效，训练更稳定。
+
         奖励公式：
-            d = Discriminator(s_t, s_{t+1})         # 判别分数
+            d = Discriminator(s_t, s_{t+1})         # 判别分数，d ∈ (-∞, +∞)
             amp_reward = coef × clamp(1 - 0.25 × (d - 1)², min=0)
 
-        d 值与奖励的对应关系：
-            d = +1 → amp_reward = coef × 1.0（满分，完美匹配专家）
-            d = -1 → amp_reward = coef × 0.0（零分，完全不像专家）
-            d = +3 → amp_reward = coef × 0.0（被 clamp 截断，防止过拟合）
+        为什么系数是 0.25 = 1/4：
+            训练目标：专家 → d=+1，策略 → d=-1，两者距离 = 2
+            0.25 = 1/(距离²) = 1/2² = 1/4
+            作用：让 d 从 -1 到 +1 刚好映射到奖励从 0 到 1
+                d = +1（专家级） → 1 - 0.25×0   = 1.0（满分）
+                d =  0（中间态） → 1 - 0.25×1   = 0.75
+                d = -1（策略级） → 1 - 0.25×4   = 0.0（零分）
+                d < -1 或 d > +3 → clamp 截断为 0（防止过拟合）
 
         最终奖励（当 task_reward_lerp=0.7 时）：
             total = 0.3 × amp_reward + 0.7 × task_reward
-            即 30% 风格奖励 + 70% 任务奖励
+            即 30% 风格奖励（像不像人类走路）+ 70% 任务奖励（走得快不快、稳不稳）
 
         Args:
-            state: 当前帧 AMP 状态（关节角度、角速度、末端位置等）
-            next_state: 下一帧 AMP 状态
+            state: 当前帧 AMP 状态 s_t，52维（关节角度、角速度、末端位置）
+            next_state: 下一帧 AMP 状态 s_{t+1}
             task_reward: 环境任务奖励（速度跟踪、步态等）
             normalizer: 可选的状态归一化器
         Returns:
@@ -169,17 +183,28 @@ class Discriminator(nn.Module):
                 state = normalizer.normalize_torch(state, self.device)
                 next_state = normalizer.normalize_torch(next_state, self.device)
 
-            # 2. 判别器前向传播：输入两帧拼接，输出判别分数 d
+            # 2. 判别器前向传播：
+            #    输入 [s_t, s_{t+1}] 拼接成 104 维 → trunk 特征提取 → amp_linear 输出标量 d
+            #    d 无 Sigmoid 约束（LSGAN），d ∈ (-∞, +∞)
             d = self.amp_linear(self.trunk(torch.cat([state, next_state], dim=-1)))
 
-            # 3. 将判别分数转换为奖励值
-            # 公式：reward = coef × clamp(1 - 0.25 × (d - 1)², min=0)
-            # 当 d=1 时奖励最大（像专家），d 偏离 1 越远奖励越低
+            # 3. 将判别分数 d 转换为奖励值
+            #    公式：reward = coef × clamp(1 - (1/4) × (d - 1)², min=0)
+            #    d=+1 满分（像专家），d=-1 零分（像策略初期的乱动），d 偏离更远则 clamp 到 0
+            #
+            #    为什么 clamp(min=0)，不允许负数：
+            #      如果允许负奖励，不像专家的动作会被"惩罚"，策略会变得保守不敢探索。
+            #      设计意图：不像专家 → 奖励=0（不鼓励但不惩罚），像专家 → 奖励>0（鼓励）。
+            #
+            #    为什么满分是 1.0：
+            #      1.0 只是归一化后的"单位满分"，实际奖励幅度由 amp_reward_coef 控制。
+            #      实际奖励范围 = [0, amp_reward_coef] = [0, 0.3]，方便只调一个系数就能控制幅度。
             reward = self.amp_reward_coef * torch.clamp(
                 1 - (1 / 4) * torch.square(d - 1), min=0
             )
 
             # 4. 与任务奖励进行线性插值混合
+            #    lerp=0.7 时：最终奖励 = 30% AMP风格奖励 + 70% 任务奖励
             if self.task_reward_lerp > 0:
                 reward = self._lerp_reward(reward, task_reward.unsqueeze(-1))
 
@@ -191,7 +216,8 @@ class Discriminator(nn.Module):
         线性插值混合判别器奖励与任务奖励。
 
         公式：r = (1 - lerp) × disc_r + lerp × task_r
-        当 lerp=0.7 时：r = 0.3 × 判别器奖励 + 0.7 × 任务奖励
+        当 lerp=0.7 时：r = 0.3 × 判别器奖励（风格像不像） + 0.7 × 任务奖励（走得好不好）
         """
         r = (1.0 - self.task_reward_lerp) * disc_r + self.task_reward_lerp * task_r
         return r
+

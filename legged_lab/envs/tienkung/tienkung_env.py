@@ -318,6 +318,22 @@ class TienKungEnv(VecEnv):
             device=self.device,
             requires_grad=False,
         )
+
+        # ====== 终态 AMP 观测缓存（用于修复 Reset 边界问题）======
+        # 在每次环境重置之前，把该环境的最后一帧 AMP 状态保存在这里
+        # Runner 可以用这个来替换 reset 后错误的初始姿态，保证判别器看到正确的 (s_t, s_terminal) 对
+        # AMP obs 维度 = 2×(所有关节角度+速度) + 4个末端×3D位置
+        self._amp_obs_dim = (
+            2 * (len(self.left_arm_ids) + len(self.right_arm_ids)
+                 + len(self.left_leg_ids) + len(self.right_leg_ids))
+            + 12  # 左手(3) + 右手(3) + 左脚(3) + 右脚(3)
+        )
+        self.terminal_amp_obs = torch.zeros(
+            self.num_envs, self._amp_obs_dim, dtype=torch.float, device=self.device
+        )
+
+
+
         # phase_ratio: 摆动相占比 [0.38, 0.38]，即每只脚 38% 时间在空中
         self.phase_ratio = torch.tensor(
             [self.cfg.gait.gait_air_ratio_l, self.cfg.gait.gait_air_ratio_r],
@@ -732,7 +748,12 @@ class TienKungEnv(VecEnv):
         reward_buf = self.reward_manager.compute(self.step_dt)
         # 9.3 找到刚刚摔倒或超时需要被重置的环境索引并执行 Reset 重置
         self.reset_env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
+        # [修复] 在 reset() 之前保存终态 AMP 观测，确保判别器能看到"摔倒瞬间"的真实状态
+        # reset() 执行后关节位置/速度会归为初始值，终态就永久丢失了
+        if len(self.reset_env_ids) > 0:
+            self.terminal_amp_obs[self.reset_env_ids] = self.get_amp_obs_for_expert_trans()[self.reset_env_ids]
         self.reset(self.reset_env_ids)
+
 
         # ====== 10. 计算下一时刻的观测，返回给 PPO 算法更新策略 ======
         actor_obs, critic_obs = self.compute_observations()
@@ -848,14 +869,44 @@ class TienKungEnv(VecEnv):
         return actor_obs, self.extras
 
     def get_amp_obs_for_expert_trans(self):
-        """Gets amp obs from policy"""
+        """
+        计算当前时刻的 52 维 AMP 状态观测，供判别器与专家动捕数据对比。
+
+        输出格式（按 cat 顺序）：
+          [0  :10] 右臂+左臂关节角度（各5维）
+          [10 :22] 右腿+左腿关节角度（各6维）
+          [22 :42] 右臂+左臂+右腿+左腿关节速度（同维度）
+          [40 :46] 左手/右手位置（各3D，相对根节点，根坐标系下）
+          [46 :52] 左脚/右脚位置（各3D，相对根节点，根坐标系下）
+        注：具体维度以实际关节数为准，合计 52 维。
+
+        坐标变换逻辑：
+          1. body_pos - root_pos → 相对位置（去掉机器人整体位移）
+          2. quat_apply(quat_conjugate(root_quat), rel_pos) → 转到根坐标系（去掉机器人整体朝向）
+          这样无论机器人在世界中走到哪个位置/朝哪个方向，AMP 状态只反映"局部姿态"，
+          与动捕数据的坐标系一致，判别器才能做有效对比。
+        """
+        # ====== 手部位置计算（分两步，模型里没有"手"body，用肘+前臂偏移近似）======
+        #
+        # 第一步（L871-878）：计算"手相对腰的位置向量"，方向仍是世界坐标系
+        #   A = 左肘世界坐标 - 腰世界坐标       → 肘相对腰的向量（世界方向）
+        #   B = quat_rotate(肘姿态, 前臂本地向量) → 把"肘→手"的本地方向旋转到世界方向
+        #   A + B = 手相对腰的位置（世界方向）   ← 此时坐标原点=腰，但坐标轴=世界坐标系
+        #
+        # 第二步（L889-891）：把坐标轴也转成机器人自身坐标系
+        #   quat_apply(quat_conjugate(腰姿态), 上一步结果)
+        #   → 手相对腰的位置（根坐标系方向）    ← 坐标原点=腰，坐标轴=机器人自身坐标系 ✓
+        #
+        # 为什么要两步：仿真器只提供世界坐标系数据，第一步去位移，第二步去朝向，缺一不可。
+
+        # 第一步：世界系下"手相对腰"的位置（坐标轴仍是世界系）
         left_hand_pos = (
-            self.robot.data.body_state_w[:, self.elbow_body_ids[0], :3]
-            - self.robot.data.root_state_w[:, 0:3]
+            self.robot.data.body_state_w[:, self.elbow_body_ids[0], :3]   # 左肘世界坐标 xyz
+            - self.robot.data.root_state_w[:, 0:3]                         # 减去腰部世界坐标（去位移）
             + quat_rotate(
-                self.robot.data.body_state_w[:, self.elbow_body_ids[0], 3:7],
-                self.left_arm_local_vec,
-            )
+                self.robot.data.body_state_w[:, self.elbow_body_ids[0], 3:7],  # 左肘四元数（世界朝向）
+                self.left_arm_local_vec,                                         # 前臂方向（肘本地坐标系，固定值）
+            )   # quat_rotate 把本地前臂方向转到世界方向，加上后得到肘→手的世界偏移
         )
         right_hand_pos = (
             self.robot.data.body_state_w[:, self.elbow_body_ids[1], :3]
@@ -865,51 +916,62 @@ class TienKungEnv(VecEnv):
                 self.right_arm_local_vec,
             )
         )
+
+        # 第二步：把世界系朝向旋转成根坐标系朝向（去机器人整体转向）
+        # quat_conjugate(root_quat) = 腰部姿态的逆旋转，等价于"把机器人面朝方向转回正前方"
         left_hand_pos = quat_apply(
             quat_conjugate(self.robot.data.root_state_w[:, 3:7]), left_hand_pos
-        )
+        )   # 结果：手在根坐标系下的位置（原点=腰，轴=机器人自身坐标系）
         right_hand_pos = quat_apply(
             quat_conjugate(self.robot.data.root_state_w[:, 3:7]), right_hand_pos
         )
+
+        # ====== 脚部位置计算（脚踝关节世界坐标 - 根节点，再转到根坐标系）======
         left_foot_pos = (
-            self.robot.data.body_state_w[:, self.feet_body_ids[0], :3]
-            - self.robot.data.root_state_w[:, 0:3]
+            self.robot.data.body_state_w[:, self.feet_body_ids[0], :3]    # 左脚世界坐标
+            - self.robot.data.root_state_w[:, 0:3]                         # 减去根节点，得相对位置
         )
         right_foot_pos = (
             self.robot.data.body_state_w[:, self.feet_body_ids[1], :3]
             - self.robot.data.root_state_w[:, 0:3]
         )
         left_foot_pos = quat_apply(
-            quat_conjugate(self.robot.data.root_state_w[:, 3:7]), left_foot_pos
+            quat_conjugate(self.robot.data.root_state_w[:, 3:7]), left_foot_pos  # 转到根坐标系
         )
         right_foot_pos = quat_apply(
             quat_conjugate(self.robot.data.root_state_w[:, 3:7]), right_foot_pos
         )
-        self.left_leg_dof_pos = self.robot.data.joint_pos[:, self.left_leg_ids]
-        self.right_leg_dof_pos = self.robot.data.joint_pos[:, self.right_leg_ids]
-        self.left_leg_dof_vel = self.robot.data.joint_vel[:, self.left_leg_ids]
-        self.right_leg_dof_vel = self.robot.data.joint_vel[:, self.right_leg_ids]
-        self.left_arm_dof_pos = self.robot.data.joint_pos[:, self.left_arm_ids]
-        self.right_arm_dof_pos = self.robot.data.joint_pos[:, self.right_arm_ids]
-        self.left_arm_dof_vel = self.robot.data.joint_vel[:, self.left_arm_ids]
-        self.right_arm_dof_vel = self.robot.data.joint_vel[:, self.right_arm_ids]
+
+        # ====== 读取各关节角度和速度 ======
+        self.left_leg_dof_pos  = self.robot.data.joint_pos[:, self.left_leg_ids]   # 左腿关节角度
+        self.right_leg_dof_pos = self.robot.data.joint_pos[:, self.right_leg_ids]  # 右腿关节角度
+        self.left_leg_dof_vel  = self.robot.data.joint_vel[:, self.left_leg_ids]   # 左腿关节速度
+        self.right_leg_dof_vel = self.robot.data.joint_vel[:, self.right_leg_ids]  # 右腿关节速度
+        self.left_arm_dof_pos  = self.robot.data.joint_pos[:, self.left_arm_ids]   # 左臂关节角度
+        self.right_arm_dof_pos = self.robot.data.joint_pos[:, self.right_arm_ids]  # 右臂关节角度
+        self.left_arm_dof_vel  = self.robot.data.joint_vel[:, self.left_arm_ids]   # 左臂关节速度
+        self.right_arm_dof_vel = self.robot.data.joint_vel[:, self.right_arm_ids]  # 右臂关节速度
+
+        # ====== 拼接成 52 维 AMP 状态向量并返回 ======
+        # 顺序须与 walk.txt 动捕数据的列顺序完全一致，判别器才能做有效对比
         return torch.cat(
             (
-                self.right_arm_dof_pos,
-                self.left_arm_dof_pos,
-                self.right_leg_dof_pos,
-                self.left_leg_dof_pos,
-                self.right_arm_dof_vel,
-                self.left_arm_dof_vel,
-                self.right_leg_dof_vel,
-                self.left_leg_dof_vel,
-                left_hand_pos,
-                right_hand_pos,
-                left_foot_pos,
-                right_foot_pos,
+                self.right_arm_dof_pos,   # 右臂角度
+                self.left_arm_dof_pos,    # 左臂角度
+                self.right_leg_dof_pos,   # 右腿角度
+                self.left_leg_dof_pos,    # 左腿角度
+                self.right_arm_dof_vel,   # 右臂速度
+                self.left_arm_dof_vel,    # 左臂速度
+                self.right_leg_dof_vel,   # 右腿速度
+                self.left_leg_dof_vel,    # 左腿速度
+                left_hand_pos,            # 左手位置（根坐标系，3D）
+                right_hand_pos,           # 右手位置（根坐标系，3D）
+                left_foot_pos,            # 左脚位置（根坐标系，3D）
+                right_foot_pos,           # 右脚位置（根坐标系，3D）
             ),
             dim=-1,
         )
+
 
     @staticmethod
     def seed(seed: int = -1) -> int:

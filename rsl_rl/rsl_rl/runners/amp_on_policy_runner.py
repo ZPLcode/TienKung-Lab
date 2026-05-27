@@ -106,23 +106,27 @@ class AmpOnPolicyRunner:
             # this is used by the symmetry function for handling different observation terms
             self.alg_cfg["symmetry_cfg"]["_env"] = env
 
-        # init amp loader
+        # ====== [AMP新增] 以下三个组件是 AMP Runner 独有的，普通 OnPolicyRunner 没有 ======
+        # 1. AMPLoader：读取 walk.txt/run.txt，预采样 100万对 (s_t, s_{t+1}) 存到 GPU
         amp_data = AMPLoader(
             device,
-            time_between_frames=self.env.step_dt,
+            time_between_frames=self.env.step_dt,   # 控制步长 0.02s
             preload_transitions=True,
             num_preload_transitions=train_cfg["amp_num_preload_transitions"],
-            motion_files=train_cfg["amp_motion_files"],
+            motion_files=train_cfg["amp_motion_files"],  # [walk.txt, run.txt]
         )
+        # 2. Normalizer：对 52维 AMP 状态做在线均值-方差归一化，防止量纲不同导致训练不稳定
         amp_normalizer = Normalizer(amp_data.observation_dim)
+        # 3. Discriminator：判别策略/专家轨迹，输出 AMP 奖励
         discriminator = Discriminator(
-            amp_data.observation_dim * 2,
-            train_cfg["amp_reward_coef"],
-            train_cfg["amp_discr_hidden_dims"],
+            amp_data.observation_dim * 2,           # input_dim = 52x2 = 104（s_t 和 s_{t+1} 拼接）
+            train_cfg["amp_reward_coef"],            # AMP 奖励系数 = 0.3
+            train_cfg["amp_discr_hidden_dims"],      # 隐藏层维度 = [1024, 512, 256]
             device,
-            train_cfg["amp_task_reward_lerp"],
+            train_cfg["amp_task_reward_lerp"],       # 任务奖励混合比例 = 0.7
         ).to(self.device)
         min_std = torch.zeros(len(train_cfg["min_normalized_std"]), device=self.device, requires_grad=False)
+
 
         # initialize algorithm
         alg_class = eval(self.alg_cfg.pop("class_name"))
@@ -241,10 +245,13 @@ class AmpOnPolicyRunner:
             # ------ A. Rollout 采样交互阶段：不计算梯度以提升采样效率 ------
             with torch.inference_mode():
                 for _ in range(self.num_steps_per_env):
-                    # 1. 策略前向传播，决定动作。这里传入了额外的 amp_obs 动捕观测
+                    # 1. 策略前向传播决定动作
+                    # [AMP新增] 普通 Runner 只传 act(obs, privileged_obs)
+                    # AMP Runner 额外传 amp_obs，让 act() 把它存入 amp_transition 备用
                     actions = self.alg.act(obs, privileged_obs, amp_obs)
                     # 2. 将动作传入物理仿真器前进一步，获取新观测值与重置信号
                     obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
+                    # [AMP新增] 获取这一步执行后的 s_{t+1}（52维 AMP 状态），普通 Runner 不需要这行
                     next_amp_obs = self.env.get_amp_obs_for_expert_trans()
                     # Move to device
                     obs, rewards, dones, next_amp_obs = (
@@ -262,21 +269,27 @@ class AmpOnPolicyRunner:
                     else:
                         privileged_obs = obs
 
-                    # 4. 特殊处理终止（Reset）环境的 AMP 观测过渡态：
-                    #    如果环境重置了，其原本的 next_amp_obs 会直接跳转到新回合的初始姿态。
-                    #    为了计算上一步动作的拟真度，我们需要将重置环境的 next_amp_obs 强行覆盖为“倒地/死亡前的最后一帧”实际终态。
-                    next_amp_obs_with_term = torch.clone(next_amp_obs)
-                    reset_env_ids = self.env.reset_env_ids
-                    terminal_amp_states = self.env.get_amp_obs_for_expert_trans()[reset_env_ids]
-                    next_amp_obs_with_term[reset_env_ids] = terminal_amp_states
+                    # ====== [AMP新增] 以下是普通 Runner 完全没有的逻辑 ======
 
-                    # 5. 【AMP 核心逻辑】使用鉴别器网络评估当前转换的拟真度，生成对抗风格奖励，并与任务奖励融合
+                    # 4. 处理 Reset 环境的 AMP 状态边界问题：
+                    #    问题：env.step() 内部已完成重置，next_amp_obs[reset_ids] 是新回合初始姿态
+                    #    解决：在 env.step() 内 reset() 调用前，终态已存入 env.terminal_amp_obs
+                    #    这里直接取 terminal_amp_obs，得到真正的"摔倒前最后一帧"
+                    next_amp_obs_with_term = torch.clone(next_amp_obs)
+                    reset_env_ids = self.env.reset_env_ids                          # 本步发生重置的环境 ID
+                    if len(reset_env_ids) > 0:
+                        # [修复] 使用 env.terminal_amp_obs（reset前保存的真实终态），而非 reset后的初始姿态
+                        next_amp_obs_with_term[reset_env_ids] = self.env.terminal_amp_obs[reset_env_ids].to(self.device)
+
+
+                    # 5. 用判别器计算 AMP 奖励，替换原始任务奖励
+                    #    predict_amp_reward 内部将任务奖励和 AMP 奖励按 lerp=0.7 混合
                     rewards = self.alg.discriminator.predict_amp_reward(
                         amp_obs, next_amp_obs_with_term, rewards, normalizer=self.alg.amp_normalizer
                     )[0]
-                    amp_obs = torch.clone(next_amp_obs)
-                    
-                    # 6. 将包含 AMP 状态的数据包存入 RolloutStorage
+                    amp_obs = torch.clone(next_amp_obs)  # 更新 s_t 为下一步的起始状态
+
+                    # 6. 存入存储：普通 Runner 不传 amp 参数，AMP Runner 额外传 next_amp_obs_with_term
                     self.alg.process_env_step(rewards, dones, infos, next_amp_obs_with_term)
 
                     # Extract intrinsic rewards (only for logging)
