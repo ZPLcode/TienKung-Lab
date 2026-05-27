@@ -599,20 +599,29 @@ class TienKungEnv(VecEnv):
         return actor_obs, critic_obs
 
     def reset(self, env_ids):
+        # ====== 1. 安全检查 ======
+        # 如果当前步没有任何环境需要重置，直接返回以节省 CPU/GPU 计算资源
         if len(env_ids) == 0:
             return
 
-        # Reset buffer
+        # ====== 2. 清空单步足部物理量缓存 ======
+        # 将被重置环境对应的足底平均接触力和平均速度清零
         self.avg_feet_force_per_step[env_ids] = 0.0
         self.avg_feet_speed_per_step[env_ids] = 0.0
 
+        # ====== 3. 更新课程学习（Curriculum Learning）地形等级 ======
         self.extras["log"] = dict()
         if self.cfg.scene.terrain_generator is not None:
+            # 如果启用了地形课程（即走得好就去更难的地形，摔得多就退回到简单地形）
             if self.cfg.scene.terrain_generator.curriculum:
+                # 动态评估机器人表现并更新其所处地形的关卡等级
                 terrain_levels = self.update_terrain_levels(env_ids)
                 self.extras["log"].update(terrain_levels)
 
+        # ====== 4. 重置物理场景与执行域随机化事件 ======
+        # 4.1 在仿真场景中将机器人和物体传送回对应的起点位置
         self.scene.reset(env_ids)
+        # 4.2 触发配置在 "reset" 模式下的事件（如随机化关节初始角度、随机微调机身初始朝向等）
         if "reset" in self.event_manager.available_modes:
             self.event_manager.apply(
                 mode="reset",
@@ -621,17 +630,27 @@ class TienKungEnv(VecEnv):
                 global_env_step_count=self.sim_step_counter // self.cfg.sim.decimation,
             )
 
+        # ====== 5. 奖励管理器账目结算与超时标记 ======
+        # 5.1 结算被重置环境在上一个回合累积的各项奖励分数，并输出日志字典
         reward_extras = self.reward_manager.reset(env_ids)
         self.extras["log"].update(reward_extras)
+        # 5.2 记录超时截断标志，用于 RSL-RL 进行值函数自举（Bootstrapping）
         self.extras["time_outs"] = self.time_out_buf
 
+        # ====== 6. 清空历史缓存与重采指令 ======
+        # 6.1 为刚复活的机器人重新随机采样一组运动目标速度指令
         self.command_generator.reset(env_ids)
+        # 6.2 将 Actor 观测历史缓存、Critic 观测历史缓存以及动作延迟缓存区全部归零（切断历史干扰）
         self.actor_obs_buffer.reset(env_ids)
         self.critic_obs_buffer.reset(env_ids)
         self.action_buffer.reset(env_ids)
+        # 6.3 将本回合生存步数计数器重置为 0
         self.episode_length_buf[env_ids] = 0
 
+        # ====== 7. 写入物理引擎并同步状态 ======
+        # 7.1 将 Python 中更新好（随机化后）的机器人位置和关节数据写入 PhysX 物理仿真引擎
         self.scene.write_data_to_sim()
+        # 7.2 物理仿真器执行一次正向同步，确保物理世界状态立即刷新生效
         self.sim.forward()
 
     def step(self, actions: torch.Tensor):
@@ -663,7 +682,7 @@ class TienKungEnv(VecEnv):
             device=self.device,
             requires_grad=False,
         )
-        
+
         # ====== 4. 执行微步物理仿真循环 ======
         # PPO 的一个控制步长（比如 20ms）通常包含多个物理引擎微步（比如 4个 5ms 物理步，即 decimation=4）
         for _ in range(self.cfg.sim.decimation):
@@ -697,7 +716,7 @@ class TienKungEnv(VecEnv):
 
         # ====== 7. 环境状态与控制命令更新 ======
         self.episode_length_buf += 1  # 增加本回合生存步数计数器
-        self._calculate_gait_para()   # 计算周期性步态参数（如支撑相/摆动相比例）
+        self._calculate_gait_para()  # 计算周期性步态参数（如支撑相/摆动相比例）
 
         # ====== 8. 指令发生器与事件管理器步进 ======
         # 更新运动指令（如摇杆给定的前向、横向和自转目标速度）
@@ -745,13 +764,13 @@ class TienKungEnv(VecEnv):
             # 最终 reset_buf 形状为 [num_envs]
             dim=1,
         )
-        
+
         # ====== 3. 超时检测（达到单回合最大生存步数限制） ======
         time_out_buf = self.episode_length_buf >= self.max_episode_length
-        
+
         # ====== 4. 合并重置信号（摔倒或超时均触发 Reset） ======
         reset_buf |= time_out_buf
-        
+
         # 同时返回总重置标志与超时标志，用于算法端的未来奖励自举（Value Bootstrapping）
         return reset_buf, time_out_buf
 
@@ -910,7 +929,7 @@ class TienKungEnv(VecEnv):
         # (生存步数 * 控制周期) 得到当前已生存的真实秒数
         # 除以单个步态周期时间 (gait_cycle, 如 0.5s)，得到当前已经运行了多少个完整的步态周期 (如 3.4 个周期)
         t = self.episode_length_buf * self.step_dt / self.gait_cycle
-        
+
         # ====== 2. 计算左脚和右脚当前的相位位置 ======
         # 加上配置的初始相位偏移 (phase_offset)，然后对 1.0 进行取余操作（% 1.0），从而将相位约束在 [0.0, 1.0) 之间
         # 0.0 表示周期刚开始，0.5 表示进行到一半，0.99 表示周期即将结束

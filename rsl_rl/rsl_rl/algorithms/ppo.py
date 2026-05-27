@@ -174,63 +174,88 @@ class PPO:
         return self.transition.actions
 
     def process_env_step(self, rewards, dones, infos):
-        # Record the rewards and dones
-        # Note: we clone here because later on we bootstrap the rewards based on timeouts
+        """
+        在每个物理仿真步结束后调用，负责处理和记录该步的交互数据（如奖励、终止信号、超时自举等），并存入 Buffer。
+        """
+        # ====== 1. 记录外在（环境）奖励与终止信号 ======
+        # 使用 .clone() 拷贝奖励张量，避免后续修改（如加入好奇心奖励、超时自举等）污染环境中的原始数据
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
 
-        # Compute the intrinsic rewards and add to extrinsic rewards
+        # ====== 2. 计算 RND（随机网络蒸馏）内在好奇心奖励 ======
         if self.rnd:
-            # Obtain curiosity gates / observations from infos
+            # 从环境额外信息中获取用于计算好奇心的观测状态
             rnd_state = infos["observations"]["rnd_state"]
-            # Compute the intrinsic rewards
-            # note: rnd_state is the gated_state after normalization if normalization is used
+            # 计算内在奖励（根据预测网络对目标网络输出的拟合误差大小，误差越大代表越新颖，奖励越高）
             self.intrinsic_rewards, rnd_state = self.rnd.get_intrinsic_reward(rnd_state)
-            # Add intrinsic rewards to extrinsic rewards
+            # 将好奇心奖励累加到总奖励中，鼓励机器人探索未知的动作/状态空间
             self.transition.rewards += self.intrinsic_rewards
-            # Record the curiosity gates
+            # 记录此时的好奇心状态
             self.transition.rnd_state = rnd_state.clone()
 
-        # Bootstrapping on time outs
+        # ====== 3. 处理超时截断的价值自举（Bootstrapping） ======
+        # 这是强化学习处理有限时间步（Finite Horizon）的关键步骤：
+        # - 死亡重置（如摔倒）：dones=True，未来的期望回报确实为 0，不需处理。
+        # - 超时重置（如走满 1000 步）：dones=True，但机器人并未摔倒。若让它继续走，它还能拿更多分数。
+        # 为了不破坏马尔可夫决策过程的完整性，必须将未来的期望回报（即当前状态价值 V(s)）折现累加到当前步奖励中。
         if "time_outs" in infos:
             self.transition.rewards += self.gamma * torch.squeeze(
                 self.transition.values * infos["time_outs"].unsqueeze(1).to(self.device), 1
             )
 
-        # record the transition
+        # ====== 4. 存入 Rollout 缓存并清理 ======
+        # 4.1 将本步完整的 Transition 数据（包含 s_t, a_t, r_t, d_t, V(s_t), log_prob）存入 Rollout 存储器
         self.storage.add_transitions(self.transition)
+        # 4.2 清空临时转移变量，准备记录下一步的数据
         self.transition.clear()
+        # 4.3 若策略网络中包含循环神经网络（RNN/GRU/LSTM），将发生终止（dones=True）的环境的隐藏状态（Hidden States）强制清零
         self.policy.reset(dones)
 
     def compute_returns(self, last_critic_obs):
-        # compute value for the last step
+        """
+        计算折扣回报（Returns）和优势估计（Advantages）。
+        这会在每轮数据收集（Rollout）结束、策略网络更新前调用。
+        """
+        # ====== 1. 评估最后一帧的边界自举状态价值 ======
+        # 为了计算最后一步（例如第 23 步）的 TD 误差，必须知晓其执行动作后达到的最新状态（即第 24 步开头，last_critic_obs）的估值。
+        # 用 .detach() 截断梯度以防止前向图保留造成显存泄露。
         last_values = self.policy.evaluate(last_critic_obs).detach()
+        
+        # ====== 2. 调用存储区计算 GAE 和 Returns ======
+        # 将边界自举值、折扣因子 gamma、偏差平衡因子 lam 传入 RolloutStorage。
+        # 如果没有配置在 mini-batch 内归一化，则会在整个 Batch 范围对优势 Advantage 进行均值方差归一化。
         self.storage.compute_returns(
             last_values, self.gamma, self.lam, normalize_advantage=not self.normalize_advantage_per_mini_batch
         )
 
     def update(self):  # noqa: C901
+        """
+        PPO 算法的核心网络参数更新阶段。
+        读取 Rollout 缓存区数据，切分成 Mini-Batches，前向传播算 Loss，反向传播更新 Actor & Critic。
+        """
+        # ====== 1. 初始化各项 Loss 和指标统计累加器 ======
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
-        # -- RND loss
+        # RND 好奇心损失统计
         if self.rnd:
             mean_rnd_loss = 0
         else:
             mean_rnd_loss = None
-        # -- Symmetry loss
+        # 步态对称性损失统计
         if self.symmetry:
             mean_symmetry_loss = 0
         else:
             mean_symmetry_loss = None
 
-        # generator for mini batches
+        # ====== 2. 实例化 Mini-Batch 生成器 ======
+        # 根据是否是循环神经网络选择不同的生成器（Recurrent 生成器需要保持轨迹时序的连续性）
         if self.policy.is_recurrent:
             generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         else:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
 
-        # iterate over batches
+        # ====== 3. 循环遍历提取 Mini-Batch 数据包进行更新 ======
         for (
             obs_batch,
             critic_obs_batch,
@@ -246,54 +271,55 @@ class PPO:
             rnd_state_batch,
         ) in generator:
 
-            # number of augmentations per sample
-            # we start with 1 and increase it if we use symmetry augmentation
+            # 记录对称数据增强的倍数（默认为 1，若开启对称增强则会翻倍）
             num_aug = 1
-            # original batch size
+            # 记录当前 Mini-Batch 的原始样本大小
             original_batch_size = obs_batch.shape[0]
 
-            # check if we should normalize advantages per mini batch
+            # ====== 3.1 优势函数局部归一化 (若启用) ======
+            # 在小批量 Mini-Batch 内部再次归一化 Advantage，能够进一步稳定梯度下降
             if self.normalize_advantage_per_mini_batch:
                 with torch.no_grad():
                     advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1e-8)
 
-            # Perform symmetric augmentation
+            # ====== 3.2 执行对称数据增强 (Symmetry Data Augmentation) ======
+            # 作用：人形机器人左右腿天然对称。把“左腿迈步，右腿支撑”的数据，镜像成“右腿迈步，左腿支撑”也是合理的。
+            # 这能让我们零成本地将样本量翻倍，同时强迫网络不要学出跛脚走等畸形动作。
             if self.symmetry and self.symmetry["use_data_augmentation"]:
-                # augmentation using symmetry
                 data_augmentation_func = self.symmetry["data_augmentation_func"]
-                # returned shape: [batch_size * num_aug, ...]
+                # 镜像普通观测和动作
                 obs_batch, actions_batch = data_augmentation_func(
                     obs=obs_batch, actions=actions_batch, env=self.symmetry["_env"], obs_type="policy"
                 )
+                # 镜像特权观测
                 critic_obs_batch, _ = data_augmentation_func(
                     obs=critic_obs_batch, actions=None, env=self.symmetry["_env"], obs_type="critic"
                 )
-                # compute number of augmentations per sample
+                # 计算翻倍倍数（通常是 2 倍）
                 num_aug = int(obs_batch.shape[0] / original_batch_size)
-                # repeat the rest of the batch
-                # -- actor
+                # 将对应的旧 log_prob、旧 V 估值、优势值、折扣回报也复制重复相同的倍数以保持张量对齐
                 old_actions_log_prob_batch = old_actions_log_prob_batch.repeat(num_aug, 1)
-                # -- critic
                 target_values_batch = target_values_batch.repeat(num_aug, 1)
                 advantages_batch = advantages_batch.repeat(num_aug, 1)
                 returns_batch = returns_batch.repeat(num_aug, 1)
 
-            # Recompute actions log prob and entropy for current batch of transitions
-            # Note: we need to do this because we updated the policy with the new parameters
-            # -- actor
+            # ====== 3.3 最新策略前向传播评估 ======
+            # 注意：因为策略网络参数已经发生了改变，我们必须重新评估当前状态以获得最新的输出
+            # -- Actor 前向传播：计算在当前最新策略下的动作概率
             self.policy.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
-            # -- critic
+            # -- Critic 前向传播：计算最新的状态价值评估
             value_batch = self.policy.evaluate(critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
-            # -- entropy
-            # we only keep the entropy of the first augmentation (the original one)
+            # -- 动作分布熵：为了公平评估探索程度，只截取原始非增强部分的熵大小
             mu_batch = self.policy.action_mean[:original_batch_size]
             sigma_batch = self.policy.action_std[:original_batch_size]
             entropy_batch = self.policy.entropy[:original_batch_size]
 
-            # KL
+            # ====== 3.4 自适应 KL 散度与学习率动态调节 (Adaptive KL Scheduler) ======
+            # PPO 必须限制新策略和老策略不能差异过大。除了 Clip 操作，还可以计算 KL 散度动态改 LR
             if self.desired_kl is not None and self.schedule == "adaptive":
                 with torch.inference_mode():
+                    # 计算两个多维高斯分布之间的 KL 散度
                     kl = torch.sum(
                         torch.log(sigma_batch / old_sigma_batch + 1.0e-5)
                         + (torch.square(old_sigma_batch) + torch.square(old_mu_batch - mu_batch))
@@ -303,41 +329,45 @@ class PPO:
                     )
                     kl_mean = torch.mean(kl)
 
-                    # Reduce the KL divergence across all GPUs
+                    # 多 GPU 分布式训练下，将所有卡上的 KL 散度求和求平均，确保 LR 调整一致
                     if self.is_multi_gpu:
                         torch.distributed.all_reduce(kl_mean, op=torch.distributed.ReduceOp.SUM)
                         kl_mean /= self.gpu_world_size
 
-                    # Update the learning rate
-                    # Perform this adaptation only on the main process
-                    # TODO: Is this needed? If KL-divergence is the "same" across all GPUs,
-                    #       then the learning rate should be the same across all GPUs.
+                    # 主进程根据 KL 散度大小自适应缩放学习率
                     if self.gpu_global_rank == 0:
                         if kl_mean > self.desired_kl * 2.0:
+                            # KL 太大（策略变化太快），强行降低学习率，防止更新崩坏
                             self.learning_rate = max(1e-5, self.learning_rate / 1.5)
                         elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
+                            # KL 太小（策略变化保守），适度增大学习率，加快收敛速度
                             self.learning_rate = min(1e-2, self.learning_rate * 1.5)
 
-                    # Update the learning rate for all GPUs
+                    # 广播更新后的学习率给所有 GPU
                     if self.is_multi_gpu:
                         lr_tensor = torch.tensor(self.learning_rate, device=self.device)
                         torch.distributed.broadcast(lr_tensor, src=0)
                         self.learning_rate = lr_tensor.item()
 
-                    # Update the learning rate for all parameter groups
+                    # 将新学习率应用给 PPO 的优化器参数组
                     for param_group in self.optimizer.param_groups:
                         param_group["lr"] = self.learning_rate
 
-            # Surrogate loss
+            # ====== 3.5 计算 PPO Actor 策略剪切损失 (Surrogate Loss) ======
+            # 计算新旧策略概率比值 r(θ) = π_new / π_old
             ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
+            # 未剪切的优势损失
             surrogate = -torch.squeeze(advantages_batch) * ratio
+            # 限制比值 r(θ) 在 [1 - ε, 1 + ε] 之间的剪切优势损失
             surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
                 ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
             )
+            # 取两者大值（相当于取最大上限，在负号作用下代表最小化该期望，防止过度策略更新）
             surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
 
-            # Value function loss
+            # ====== 3.6 计算 Critic 价值评估损失 (Value Function Loss) ======
             if self.use_clipped_value_loss:
+                # 类似 PPO，限制新 V 预测相比于旧 V 预测的更新幅度不能超出 clip 阈值，增加稳定性
                 value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
                     -self.clip_param, self.clip_param
                 )
@@ -345,101 +375,95 @@ class PPO:
                 value_losses_clipped = (value_clipped - returns_batch).pow(2)
                 value_loss = torch.max(value_losses, value_losses_clipped).mean()
             else:
+                # 常规 MSE（均方误差损失）
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
+            # ====== 3.7 合并 PPO 总损失 (Total Loss) ======
+            # 总 Loss = 策略 Clip 损失 + c1 * 价值 MSE 损失 - c2 * 熵增鼓励
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
-            # Symmetry loss
+            # ====== 3.8 计算对称镜像损失 (Symmetry / Mirror Loss, 若启用) ======
+            # 作用：就算不用对称数据增强，也要在损失里直接加入惩罚。
+            # 当你输入镜像后的观测，Actor 预测出的动作应当“等于”原始动作进行镜像变换后的结果。如果不等，就惩罚。
             if self.symmetry:
-                # obtain the symmetric actions
-                # if we did augmentation before then we don't need to augment again
                 if not self.symmetry["use_data_augmentation"]:
                     data_augmentation_func = self.symmetry["data_augmentation_func"]
                     obs_batch, _ = data_augmentation_func(
                         obs=obs_batch, actions=None, env=self.symmetry["_env"], obs_type="policy"
                     )
-                    # compute number of augmentations per sample
                     num_aug = int(obs_batch.shape[0] / original_batch_size)
 
-                # actions predicted by the actor for symmetrically-augmented observations
+                # 计算镜像观测对应的动作均值
                 mean_actions_batch = self.policy.act_inference(obs_batch.detach().clone())
-
-                # compute the symmetrically augmented actions
-                # note: we are assuming the first augmentation is the original one.
-                #   We do not use the action_batch from earlier since that action was sampled from the distribution.
-                #   However, the symmetry loss is computed using the mean of the distribution.
                 action_mean_orig = mean_actions_batch[:original_batch_size]
+                # 计算原始动作的理论镜像结果
                 _, actions_mean_symm_batch = data_augmentation_func(
                     obs=None, actions=action_mean_orig, env=self.symmetry["_env"], obs_type="policy"
                 )
 
-                # compute the loss (we skip the first augmentation as it is the original one)
+                # 计算两者间的 MSE 差异
                 mse_loss = torch.nn.MSELoss()
                 symmetry_loss = mse_loss(
                     mean_actions_batch[original_batch_size:], actions_mean_symm_batch.detach()[original_batch_size:]
                 )
-                # add the loss to the total loss
+                # 若开启对称镜像损失约束，将其加入总 Loss 一起反向传播
                 if self.symmetry["use_mirror_loss"]:
                     loss += self.symmetry["mirror_loss_coeff"] * symmetry_loss
                 else:
                     symmetry_loss = symmetry_loss.detach()
 
-            # Random Network Distillation loss
+            # ====== 3.9 计算 RND 好奇心蒸馏损失 (RND Loss, 若启用) ======
             if self.rnd:
-                # predict the embedding and the target
+                # Predictor 网络拟合 frozen Target 网络的输出
                 predicted_embedding = self.rnd.predictor(rnd_state_batch)
                 target_embedding = self.rnd.target(rnd_state_batch).detach()
-                # compute the loss as the mean squared error
                 mseloss = torch.nn.MSELoss()
                 rnd_loss = mseloss(predicted_embedding, target_embedding)
 
-            # Compute the gradients
-            # -- For PPO
+            # ====== 3.10 梯度计算与回传 ======
+            # -- PPO 网络清空并回传梯度
             self.optimizer.zero_grad()
             loss.backward()
-            # -- For RND
+            # -- RND 网络清空并回传梯度
             if self.rnd:
                 self.rnd_optimizer.zero_grad()  # type: ignore
                 rnd_loss.backward()
 
-            # Collect gradients from all GPUs
+            # ====== 3.11 多 GPU 梯度同步汇总 ======
             if self.is_multi_gpu:
                 self.reduce_parameters()
 
-            # Apply the gradients
-            # -- For PPO
+            # ====== 3.12 参数应用更新 (Optimizer Step) ======
+            # -- 裁剪 PPO 策略梯度，防止动作突变、大参数爆炸
             nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
             self.optimizer.step()
-            # -- For RND
+            # -- 更新 RND
             if self.rnd_optimizer:
                 self.rnd_optimizer.step()
 
-            # Store the losses
+            # ====== 3.13 累加当前步损失，用于后续求均值统计 ======
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
             mean_entropy += entropy_batch.mean().item()
-            # -- RND loss
             if mean_rnd_loss is not None:
                 mean_rnd_loss += rnd_loss.item()
-            # -- Symmetry loss
             if mean_symmetry_loss is not None:
                 mean_symmetry_loss += symmetry_loss.item()
 
-        # -- For PPO
+        # ====== 4. 计算整个迭代更新的平均损失数值 ======
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
-        # -- For RND
         if mean_rnd_loss is not None:
             mean_rnd_loss /= num_updates
-        # -- For Symmetry
         if mean_symmetry_loss is not None:
             mean_symmetry_loss /= num_updates
-        # -- Clear the storage
+            
+        # ====== 5. 清空 Rollout 缓存，重置步指针 ======
         self.storage.clear()
 
-        # construct the loss dictionary
+        # ====== 6. 构造日志字典并返回 ======
         loss_dict = {
             "value_function": mean_value_loss,
             "surrogate": mean_surrogate_loss,

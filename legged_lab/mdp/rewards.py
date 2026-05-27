@@ -67,24 +67,47 @@ def track_ang_vel_z_world_exp(
     std: float,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
+    """
+    计算底盘绕世界坐标系 Z 轴（垂直方向）的偏航角速度（自转角速度）跟踪奖励，采用指数衰减形式。
+    """
+    # ====== 1. 从环境场景中获取机器人的 Articulation（多关节刚体）对象 ======
     asset: Articulation = env.scene[asset_cfg.name]
+    
+    # ====== 2. 计算目标自转速度与实际自转速度的偏差平方 ======
+    # 2.1 env.command_generator.command[:, 2]：指令中的期望自转速度（绕 Z 轴角速度，正值为左转，负值为右转）
+    # 2.2 asset.data.root_ang_vel_w[:, 2]：机器人在世界系下实际绕 Z 轴的角速度
+    # 2.3 这里的偏航转动完全对应于绕重力轴（Z轴）的旋转，因此无需进行复杂的坐标投影，直接用世界系分量求差值即可
     ang_vel_error = torch.square(
         env.command_generator.command[:, 2] - asset.data.root_ang_vel_w[:, 2]
     )
+    
+    # ====== 3. 计算并返回指数形式的奖励值 ======
+    # 同样在误差为 0 时给出满分 1.0，自转偏差越大得分平滑衰减。std (标准差) 同样设定为 0.5
     return torch.exp(-ang_vel_error / std**2)
 
 
 def lin_vel_z_l2(
     env: BaseEnv | TienKungEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
+    """
+    计算骨盆在机身系下垂直方向（Z 轴）线速度的 L2 范数平方。
+    在配置中该项权重为负（-1.0），作为惩罚项使用，目的是约束机器人上下颠簸和蹦跳，保持重心高度平稳。
+    """
     asset: Articulation = env.scene[asset_cfg.name]
+    # root_lin_vel_b[:, 2] 为机身坐标系下垂直方向的速度，对其求平方以惩罚双方向的窜动
     return torch.square(asset.data.root_lin_vel_b[:, 2])
 
 
 def ang_vel_xy_l2(
     env: BaseEnv | TienKungEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
+    """
+    计算骨盆在机身系下横滚（Roll/X轴）和俯仰（Pitch/Y轴）角速度的 L2 范数平方。
+    在配置中该项权重为负（-0.05），作为惩罚项使用，用于抑制机身的前倾后仰和左右晃动，强迫躯干保持直立和稳定。
+    """
     asset: Articulation = env.scene[asset_cfg.name]
+    # 1. asset.data.root_ang_vel_b[:, :2] 提取机身坐标系下的横滚（Roll）与俯仰（Pitch）角速度
+    # 2. 对每个元素求平方，并在 dim=1（坐标轴维度）上求和，得到 (roll_rate^2 + pitch_rate^2)
     return torch.sum(torch.square(asset.data.root_ang_vel_b[:, :2]), dim=1)
 
 

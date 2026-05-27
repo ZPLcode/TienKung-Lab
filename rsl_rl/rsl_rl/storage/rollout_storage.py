@@ -204,42 +204,62 @@ class RolloutStorage:
 
     # for reinforcement learning with feedforward networks
     def mini_batch_generator(self, num_mini_batches, num_epochs=8):
+        """
+        适用于常规前馈神经网络（MLP）的 Mini-Batch 数据生成器。
+        它会将所有样本打乱、展平，并按指定的 Epoch 次数和 Batch 数量分批产出（yield）数据。
+        """
         if self.training_type != "rl":
             raise ValueError("This function is only available for reinforcement learning training.")
+        
+        # ====== 1. 计算样本总量与分包大小 ======
+        # 样本总量 = 并行环境数 (num_envs) * 每个环境采样的步数 (num_transitions_per_env)
+        # 例如：4096 envs * 24 steps = 98304 帧
         batch_size = self.num_envs * self.num_transitions_per_env
+        # 每个 Mini-Batch 包含的样本数
         mini_batch_size = batch_size // num_mini_batches
+        # 随机打乱样本的索引排列，生成随机排列的 index 张量（用于随机打乱样本）
         indices = torch.randperm(num_mini_batches * mini_batch_size, requires_grad=False, device=self.device)
 
-        # Core
+        # ====== 2. 展平数据维度：从时序矩阵 (Steps, Envs, Dim) 展平成一维列表 (Steps * Envs, Dim) ======
+        # 因为前馈 MLP 决策是不依赖历史前后顺序的，所以可以直接把时序轴 (dim 0) 和环境轴 (dim 1) 展平合并
+        # 将 Actor 观测值展平，例如：[24, 4096, 750] -> [98304, 750]
         observations = self.observations.flatten(0, 1)
+        
+        # 判断是否使用了非对称 Actor-Critic，若有，则展平特权观测值；若无，则直接复用普通观测值以节省显存
         if self.privileged_observations is not None:
             privileged_observations = self.privileged_observations.flatten(0, 1)
         else:
             privileged_observations = observations
 
+        # 展平动作指令、状态价值评估、折扣回报，例如：从 [24, 4096, D] 转换为 [98304, D]
         actions = self.actions.flatten(0, 1)
         values = self.values.flatten(0, 1)
         returns = self.returns.flatten(0, 1)
 
-        # For PPO
+        # ====== 2.1 提取并展平 PPO 更新所必需的老策略参数与优势信号 ======
+        # old_actions_log_prob：交互采样时旧策略（Old Policy）输出动作的对数概率，用于计算 PPO 的新旧策略比值 ratio = exp(new_log_prob - old_log_prob)
         old_actions_log_prob = self.actions_log_prob.flatten(0, 1)
+        # advantages：计算好的 GAE 优势评估值，作为 Actor 策略更新的方向舵（引导高优势动作概率增大，低优势动作概率减小）
         advantages = self.advantages.flatten(0, 1)
+        # old_mu：旧策略高斯分布的动作均值，与 old_sigma 共同配合计算新旧策略之间的 KL 散度，从而动态自适应调整学习率
         old_mu = self.mu.flatten(0, 1)
+        # old_sigma：旧策略高斯分布的动作标准差，用于计算自适应 KL 散度
         old_sigma = self.sigma.flatten(0, 1)
 
-        # For RND
+        # 提取 RND 好奇心状态并展平
         if self.rnd_state_shape is not None:
             rnd_state = self.rnd_state.flatten(0, 1)
 
+        # ====== 3. 开始多 Epoch 的分批产出数据 ======
         for epoch in range(num_epochs):
             for i in range(num_mini_batches):
-                # Select the indices for the mini-batch
+                # 3.1 切片获取当前 Mini-Batch 的索引子集
                 start = i * mini_batch_size
                 end = (i + 1) * mini_batch_size
                 batch_idx = indices[start:end]
 
-                # Create the mini-batch
-                # -- Core
+                # 3.2 根据打乱后的随机索引提取对应切片数据
+                # -- 核心输入输出
                 obs_batch = observations[batch_idx]
                 privileged_observations_batch = privileged_observations[batch_idx]
                 actions_batch = actions[batch_idx]
@@ -258,7 +278,8 @@ class RolloutStorage:
                 else:
                     rnd_state_batch = None
 
-                # yield the mini-batch
+                # 3.3 yield 产出当前 mini-batch 的全部打包数据
+                # 注：对于非 Recurrent 网络，hidden_states (None, None) 和 mask (None) 为空
                 yield obs_batch, privileged_observations_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
                     None,
                     None,
