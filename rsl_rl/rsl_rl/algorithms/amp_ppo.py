@@ -264,40 +264,51 @@ class AMPPPO:
         )
 
     def update(self):  # noqa: C901
+        """
+        AMP-PPO 核心网络参数更新阶段。
+        在 PPO 的 Actor/Critic 更新基础上，额外训练 AMP 判别器。
+        三路数据（rollout/策略回放/专家动捕）同步迭代，一次 backward 更新所有网络。
+        """
+        # ====== 1. 初始化各项损失和统计累加器 ======
+        # [AMP新增] 相比 ppo.py 多了 amp_loss / grad_pen / policy_pred / expert_pred
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
-        mean_amp_loss = 0
-        mean_grad_pen_loss = 0
-        mean_policy_pred = 0
-        mean_expert_pred = 0
-        # -- RND loss
+        mean_amp_loss = 0          # 判别器 LSGAN 损失（专家→+1，策略→-1）
+        mean_grad_pen_loss = 0     # 判别器梯度惩罚损失（防止判别器过强）
+        mean_policy_pred = 0       # 策略轨迹的平均判别分数（训练初期接近 -1，收敛后接近 +1）
+        mean_expert_pred = 0       # 专家轨迹的平均判别分数（始终应接近 +1）
         if self.rnd:
             mean_rnd_loss = 0
         else:
             mean_rnd_loss = None
-        # -- Symmetry loss
         if self.symmetry:
             mean_symmetry_loss = 0
         else:
             mean_symmetry_loss = None
 
-        # generator for mini batches
+        # ====== 2. 实例化三个并行 Mini-Batch Generator ======
+        # [AMP新增] 相比 ppo.py 多了 amp_policy_generator 和 amp_expert_generator
+        # 三路 generator 通过 zip 严格同步迭代，每次取出同等大小的 batch
         if self.policy.is_recurrent:
             generator = self.storage.recurrent_mini_batch_generator(
                 self.num_mini_batches, self.num_learning_epochs
             )
         else:
+            # rollout generator：从 RolloutStorage 取 PPO 训练数据（obs/action/reward 等）
             generator = self.storage.mini_batch_generator(
                 self.num_mini_batches, self.num_learning_epochs
             )
 
+        # 策略回放 generator：从 ReplayBuffer 随机采样策略历史状态转移 (s_t, s_{t+1})
+        # 总迭代次数 = num_epochs × num_mini_batches，batch_size = num_envs × num_steps // num_mini_batches
         amp_policy_generator = self.amp_storage.feed_forward_generator(
             self.num_learning_epochs * self.num_mini_batches,
             self.storage.num_envs
             * self.storage.num_transitions_per_env
             // self.num_mini_batches,
         )
+        # 专家数据 generator：从 AMPLoader 随机采样专家动捕状态转移 (s_t, s_{t+1})
         amp_expert_generator = self.amp_data.feed_forward_generator(
             self.num_learning_epochs * self.num_mini_batches,
             self.storage.num_envs
@@ -305,7 +316,7 @@ class AMPPPO:
             // self.num_mini_batches,
         )
 
-        # iterate over batches
+        # ====== 3. 循环遍历 Mini-Batch 进行更新 ======
         for sample, sample_amp_policy, sample_amp_expert in zip(
             generator, amp_policy_generator, amp_expert_generator
         ):
@@ -313,35 +324,32 @@ class AMPPPO:
                 obs_batch,
                 critic_obs_batch,
                 actions_batch,
-                target_values_batch,
-                advantages_batch,
-                returns_batch,
-                old_actions_log_prob_batch,
-                old_mu_batch,
-                old_sigma_batch,
+                target_values_batch,      # 旧 Critic 对 s_t 的价值估计 V_old(s_t)
+                advantages_batch,         # GAE 计算出的优势估计 A_t
+                returns_batch,            # 折扣回报目标值 R_t = A_t + V_old(s_t)
+                old_actions_log_prob_batch,  # 采样时旧策略的对数概率 log π_old(a|s)
+                old_mu_batch,             # 旧策略动作分布均值（用于 KL 计算）
+                old_sigma_batch,          # 旧策略动作分布标准差（用于 KL 计算）
                 hid_states_batch,
                 masks_batch,
                 rnd_state_batch,
             ) = sample
 
-            # number of augmentations per sample
-            # we start with 1 and increase it if we use symmetry augmentation
             num_aug = 1
-            # original batch size
             original_batch_size = obs_batch.shape[0]
 
-            # check if we should normalize advantages per mini batch
+            # ====== 3.1 优势函数局部归一化（若启用） ======
+            # 在 mini-batch 内再次归一化，进一步稳定梯度
             if self.normalize_advantage_per_mini_batch:
                 with torch.no_grad():
                     advantages_batch = (advantages_batch - advantages_batch.mean()) / (
                         advantages_batch.std() + 1e-8
                     )
 
-            # Perform symmetric augmentation
+            # ====== 3.2 对称数据增强（若启用） ======
+            # 人形机器人左右腿对称，镜像样本等价于免费获得额外训练数据
             if self.symmetry and self.symmetry["use_data_augmentation"]:
-                # augmentation using symmetry
                 data_augmentation_func = self.symmetry["data_augmentation_func"]
-                # returned shape: [batch_size * num_aug, ...]
                 obs_batch, actions_batch = data_augmentation_func(
                     obs=obs_batch,
                     actions=actions_batch,
@@ -354,38 +362,32 @@ class AMPPPO:
                     env=self.symmetry["_env"],
                     obs_type="critic",
                 )
-                # compute number of augmentations per sample
                 num_aug = int(obs_batch.shape[0] / original_batch_size)
-                # repeat the rest of the batch
-                # -- actor
-                old_actions_log_prob_batch = old_actions_log_prob_batch.repeat(
-                    num_aug, 1
-                )
-                # -- critic
+                # 其余张量也复制相同倍数以保持维度对齐
+                old_actions_log_prob_batch = old_actions_log_prob_batch.repeat(num_aug, 1)
                 target_values_batch = target_values_batch.repeat(num_aug, 1)
                 advantages_batch = advantages_batch.repeat(num_aug, 1)
                 returns_batch = returns_batch.repeat(num_aug, 1)
 
-            # Recompute actions log prob and entropy for current batch of transitions
-            # Note: we need to do this because we updated the policy with the new parameters
-            # -- actor
-            self.policy.act(
-                obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0]
-            )
+            # ====== 3.3 最新策略前向传播 ======
+            # 因为策略参数已更新，必须重新计算当前策略下的动作概率和价值
+            # -- Actor：计算新策略 log π_new(a|s)
+            self.policy.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
-            # -- critic
+            # -- Critic：计算新的状态价值估计 V_new(s)
             value_batch = self.policy.evaluate(
                 critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1]
             )
-            # -- entropy
-            # we only keep the entropy of the first augmentation (the original one)
+            # -- 熵和分布参数：只取原始非增强部分，排除镜像副本的干扰
             mu_batch = self.policy.action_mean[:original_batch_size]
             sigma_batch = self.policy.action_std[:original_batch_size]
             entropy_batch = self.policy.entropy[:original_batch_size]
 
-            # KL
+            # ====== 3.4 自适应 KL 学习率调节 ======
+            # 通过监控新旧策略的 KL 散度，动态调整学习率防止更新步长过大
             if self.desired_kl is not None and self.schedule == "adaptive":
                 with torch.inference_mode():
+                    # 多维高斯分布的 KL 散度解析公式
                     kl = torch.sum(
                         torch.log(sigma_batch / old_sigma_batch + 1.0e-5)
                         + (
@@ -398,45 +400,49 @@ class AMPPPO:
                     )
                     kl_mean = torch.mean(kl)
 
-                    # Reduce the KL divergence across all GPUs
+                    # 多 GPU：汇总所有卡的 KL 散度求均值
                     if self.is_multi_gpu:
                         torch.distributed.all_reduce(
                             kl_mean, op=torch.distributed.ReduceOp.SUM
                         )
                         kl_mean /= self.gpu_world_size
 
-                    # Update the learning rate
-                    # Perform this adaptation only on the main process
+                    # 主进程根据 KL 自适应缩放学习率
                     # TODO: Is this needed? If KL-divergence is the "same" across all GPUs,
                     #       then the learning rate should be the same across all GPUs.
                     if self.gpu_global_rank == 0:
                         if kl_mean > self.desired_kl * 2.0:
+                            # KL 过大（策略变化太快）→ 降低学习率
                             self.learning_rate = max(1e-5, self.learning_rate / 1.5)
                         elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
+                            # KL 过小（策略变化太保守）→ 提高学习率
                             self.learning_rate = min(1e-2, self.learning_rate * 1.5)
 
-                    # Update the learning rate for all GPUs
+                    # 广播更新后的学习率到所有 GPU
                     if self.is_multi_gpu:
                         lr_tensor = torch.tensor(self.learning_rate, device=self.device)
                         torch.distributed.broadcast(lr_tensor, src=0)
                         self.learning_rate = lr_tensor.item()
 
-                    # Update the learning rate for all parameter groups
                     for param_group in self.optimizer.param_groups:
                         param_group["lr"] = self.learning_rate
 
-            # Surrogate loss
+            # ====== 3.5 PPO Actor 策略裁剪损失（Surrogate Loss） ======
+            # r(θ) = π_new(a|s) / π_old(a|s) = exp(log_new - log_old)
             ratio = torch.exp(
                 actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch)
             )
             surrogate = -torch.squeeze(advantages_batch) * ratio
+            # 裁剪 r(θ) 到 [1-ε, 1+ε]，防止单步更新幅度过大
             surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
                 ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
             )
+            # 取两者中较大的（负号下等价于取最保守的更新），以 min 形式约束策略更新
             surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
 
-            # Value function loss
+            # ====== 3.6 Critic 价值评估损失（Value Function Loss） ======
             if self.use_clipped_value_loss:
+                # 类似 PPO，同样裁剪价值更新幅度，防止 Critic 突变
                 value_clipped = target_values_batch + (
                     value_batch - target_values_batch
                 ).clamp(-self.clip_param, self.clip_param)
@@ -444,18 +450,20 @@ class AMPPPO:
                 value_losses_clipped = (value_clipped - returns_batch).pow(2)
                 value_loss = torch.max(value_losses, value_losses_clipped).mean()
             else:
+                # 常规 MSE
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
+            # ====== 3.7 合并 PPO 基础损失 ======
+            # 总 Loss = Surrogate（Actor）+ c1×Value（Critic）- c2×Entropy（探索鼓励）
             loss = (
                 surrogate_loss
                 + self.value_loss_coef * value_loss
                 - self.entropy_coef * entropy_batch.mean()
             )
 
-            # Symmetry loss
+            # ====== 3.8 对称镜像损失（若启用） ======
+            # 强制网络对镜像观测输出镜像动作，防止策略学出跛脚等不对称步态
             if self.symmetry:
-                # obtain the symmetric actions
-                # if we did augmentation before then we don't need to augment again
                 if not self.symmetry["use_data_augmentation"]:
                     data_augmentation_func = self.symmetry["data_augmentation_func"]
                     obs_batch, _ = data_augmentation_func(
@@ -464,18 +472,12 @@ class AMPPPO:
                         env=self.symmetry["_env"],
                         obs_type="policy",
                     )
-                    # compute number of augmentations per sample
                     num_aug = int(obs_batch.shape[0] / original_batch_size)
 
-                # actions predicted by the actor for symmetrically-augmented observations
+                # 对镜像观测做确定性推理（用均值，不采样）
                 mean_actions_batch = self.policy.act_inference(
                     obs_batch.detach().clone()
                 )
-
-                # compute the symmetrically augmented actions
-                # note: we are assuming the first augmentation is the original one.
-                #   We do not use the action_batch from earlier since that action was sampled from the distribution.
-                #   However, the symmetry loss is computed using the mean of the distribution.
                 action_mean_orig = mean_actions_batch[:original_batch_size]
                 _, actions_mean_symm_batch = data_augmentation_func(
                     obs=None,
@@ -483,62 +485,54 @@ class AMPPPO:
                     env=self.symmetry["_env"],
                     obs_type="policy",
                 )
-
-                # compute the loss (we skip the first augmentation as it is the original one)
                 mse_loss = torch.nn.MSELoss()
                 symmetry_loss = mse_loss(
                     mean_actions_batch[original_batch_size:],
+                    # detach 让梯度只从左侧（镜像输出）反传，右侧作为固定目标
                     actions_mean_symm_batch.detach()[original_batch_size:],
                 )
-                # add the loss to the total loss
                 if self.symmetry["use_mirror_loss"]:
                     loss += self.symmetry["mirror_loss_coeff"] * symmetry_loss
                 else:
                     symmetry_loss = symmetry_loss.detach()
 
-            # Random Network Distillation loss
+            # ====== 3.9 RND 好奇心蒸馏损失（若启用） ======
+            # Predictor 网络拟合 frozen Target 网络，预测误差大的状态给额外内在奖励
             if self.rnd:
-                # predict the embedding and the target
                 predicted_embedding = self.rnd.predictor(rnd_state_batch)
                 target_embedding = self.rnd.target(rnd_state_batch).detach()
-                # compute the loss as the mean squared error
                 mseloss = torch.nn.MSELoss()
                 rnd_loss = mseloss(predicted_embedding, target_embedding)
 
-            # ====== [AMP新增] 判别器损失计算 ======
-            # 普通 PPO 的 update() 没有以下这段，这是 AMP 的核心训练逻辑
-            # sample_amp_policy: 从 ReplayBuffer 取出的策略历史状态转移 (s_t, s_{t+1})
-            # sample_amp_expert: 从 AMPLoader 取出的专家动捕状态转移 (s_t, s_{t+1})
+            # ====== 3.10 [AMP新增] 判别器损失计算 ======
+            # 以下是 AMP-PPO 相比普通 PPO 最核心的额外逻辑
+            # sample_amp_policy: 从 ReplayBuffer 取的策略历史状态转移 (s_t, s_{t+1})
+            # sample_amp_expert: 从 AMPLoader 取的专家动捕状态转移 (s_t, s_{t+1})
             policy_state, policy_next_state = sample_amp_policy
             expert_state, expert_next_state = sample_amp_expert
 
-            # 对 AMP 状态做归一化（在线均值-方差标准化）
+            # 3.10.1 对 AMP 状态做在线均值-方差归一化
+            # 注意：用 no_grad 因为归一化参数不参与梯度计算
             if self.amp_normalizer is not None:
                 with torch.no_grad():
-                    policy_state = self.amp_normalizer.normalize_torch(
-                        policy_state, self.device
-                    )
-                    policy_next_state = self.amp_normalizer.normalize_torch(
-                        policy_next_state, self.device
-                    )
-                    expert_state = self.amp_normalizer.normalize_torch(
-                        expert_state, self.device
-                    )
-                    expert_next_state = self.amp_normalizer.normalize_torch(
-                        expert_next_state, self.device
-                    )
+                    policy_state = self.amp_normalizer.normalize_torch(policy_state, self.device)
+                    policy_next_state = self.amp_normalizer.normalize_torch(policy_next_state, self.device)
+                    expert_state = self.amp_normalizer.normalize_torch(expert_state, self.device)
+                    expert_next_state = self.amp_normalizer.normalize_torch(expert_next_state, self.device)
 
-            # 判别器前向传播（Least-Squares GAN）
+            # 3.10.2 判别器前向传播
+            # 输入：将 s_t 和 s_{t+1} 拼接为 104 维向量（52 × 2）
             policy_d = self.discriminator(
                 torch.cat([policy_state, policy_next_state], dim=-1)
-            )  # 策略轨迹打分
+            )  # 策略轨迹打分，理想训练收敛后应接近 +1
             expert_d = self.discriminator(
                 torch.cat([expert_state, expert_next_state], dim=-1)
-            )  # 专家轨迹打分
+            )  # 专家轨迹打分，应始终稳定在 +1 附近
 
-            # 计算判别器 Loss：
-            #   专家数据目标分数 = +1（真实动作）
-            #   策略数据目标分数 = -1（生成动作）
+            # 3.10.3 Least-Squares GAN 损失
+            # 专家数据目标 = +1（判别器认为是真实动作）
+            # 策略数据目标 = -1（判别器认为是生成动作）
+            # 注：用 MSE 而非 BCE，避免梯度饱和问题（BCE 在置信度高时梯度趋近于 0）
             expert_loss = torch.nn.MSELoss()(
                 expert_d, torch.ones(expert_d.size(), device=self.device)
             )
@@ -547,40 +541,42 @@ class AMPPPO:
             )
             amp_loss = 0.5 * (expert_loss + policy_loss)
 
-            # 梯度惩罚：防止判别器过强导致策略梯度消失
+            # 3.10.4 梯度惩罚（Gradient Penalty）
+            # 惩罚判别器在专家数据处的输出梯度过大（参考 WGAN-GP）
+            # 防止判别器过强 → 策略收不到有效学习信号 → 训练死锁
             grad_pen_loss = self.discriminator.compute_grad_pen(
                 *sample_amp_expert, lambda_=10
             )
 
-            # 将判别器 Loss 加入总 Loss（和 PPO Loss 一起做一次反向传播）
+            # 3.10.5 将判别器损失并入总 Loss
+            # PPO Loss 和 AMP Loss 共享一次 backward，同时更新 Actor/Critic/Discriminator
             loss += self.amploss_coef * amp_loss + self.amploss_coef * grad_pen_loss
 
-            # Compute the gradients
-            # -- For PPO
+            # ====== 3.11 梯度回传与参数更新 ======
             self.optimizer.zero_grad()
-            loss.backward()
-            # -- For RND
+            loss.backward()  # 一次反向传播同时计算 policy + discriminator 的梯度
             if self.rnd:
                 self.rnd_optimizer.zero_grad()  # type: ignore
                 rnd_loss.backward()
 
-            # Collect gradients from all GPUs
+            # 多 GPU：汇总所有卡的梯度
             if self.is_multi_gpu:
                 self.reduce_parameters()
 
-            # Apply the gradients
-            # -- For PPO
+            # 裁剪 policy 梯度 L2 范数，防止梯度爆炸（只对 policy，不对 discriminator）
             nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
-            self.optimizer.step()
-            # -- For RND
+            self.optimizer.step()  # 同时更新 policy + discriminator（共享同一个 optimizer）
             if self.rnd_optimizer:
                 self.rnd_optimizer.step()
 
+            # ====== 3.12 [AMP新增] 更新 AMP 状态归一化统计 ======
+            # 用本 batch 的策略和专家数据更新在线均值-方差（Welford 算法）
+            # 注意：此时 policy_state/expert_state 是归一化后的值，更新的是计数统计
             if self.amp_normalizer is not None:
                 self.amp_normalizer.update(policy_state.cpu().numpy())
                 self.amp_normalizer.update(expert_state.cpu().numpy())
 
-            # Store the losses
+            # ====== 3.13 累加损失统计 ======
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
             mean_entropy += entropy_batch.mean().item()
@@ -588,40 +584,39 @@ class AMPPPO:
             mean_grad_pen_loss += grad_pen_loss.item()
             mean_policy_pred += policy_d.mean().item()
             mean_expert_pred += expert_d.mean().item()
-            # -- RND loss
             if mean_rnd_loss is not None:
                 mean_rnd_loss += rnd_loss.item()
-            # -- Symmetry loss
             if mean_symmetry_loss is not None:
                 mean_symmetry_loss += symmetry_loss.item()
 
-        # -- For PPO
+        # ====== 4. 计算所有 mini-batch 的平均损失 ======
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
-        # -- For RND
         if mean_rnd_loss is not None:
             mean_rnd_loss /= num_updates
-        # -- For Symmetry
         if mean_symmetry_loss is not None:
             mean_symmetry_loss /= num_updates
-        # -- Clear the storage
         mean_amp_loss /= num_updates
         mean_grad_pen_loss /= num_updates
         mean_policy_pred /= num_updates
         mean_expert_pred /= num_updates
+
+        # ====== 5. 清空 RolloutStorage，重置步指针 ======
+        # 注意：ReplayBuffer 不清空（跨轮保留历史数据）
         self.storage.clear()
 
-        # construct the loss dictionary
+        # ====== 6. 构造日志字典并返回 ======
+        # amp_policy_pred 趋近 +1 说明策略动作越来越像专家，是 AMP 训练效果的核心指标
         loss_dict = {
             "value_function": mean_value_loss,
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
             "amp": mean_amp_loss,
             "amp_grad_pen": mean_grad_pen_loss,
-            "amp_policy_pred": mean_policy_pred,
-            "amp_expert_pred": mean_expert_pred,
+            "amp_policy_pred": mean_policy_pred,   # 策略轨迹判别分数均值（收敛后应接近 +1）
+            "amp_expert_pred": mean_expert_pred,   # 专家轨迹判别分数均值（应稳定在 +1 附近）
         }
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
