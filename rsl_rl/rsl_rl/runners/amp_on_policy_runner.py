@@ -107,13 +107,17 @@ class AmpOnPolicyRunner:
             self.alg_cfg["symmetry_cfg"]["_env"] = env
 
         # ====== [AMP新增] 以下三个组件是 AMP Runner 独有的，普通 OnPolicyRunner 没有 ======
-        # 1. AMPLoader：读取 walk.txt/run.txt，预采样 100万对 (s_t, s_{t+1}) 存到 GPU
+        # 1. AMPLoader：读取专家动捕数据，预采样 200万对 (s_t, s_{t+1}) 存到 GPU
+        # 注意：amp_motion_files 是列表（支持多文件），但当前配置每个任务只放一个：
+        #       walk 任务 → ["walk.txt"]    （只学真人走路风格）
+        #       run  任务 → ["run.txt"]     （只学真人跑步风格）
+        # 判别器是"单技能"AMP，只学一种动作的分布
         amp_data = AMPLoader(
             device,
             time_between_frames=self.env.step_dt,   # 控制步长 0.02s
             preload_transitions=True,
             num_preload_transitions=train_cfg["amp_num_preload_transitions"],
-            motion_files=train_cfg["amp_motion_files"],  # [walk.txt, run.txt]
+            motion_files=train_cfg["amp_motion_files"],  # 单文件列表，例如 ["walk.txt"]
         )
         # 2. Normalizer：对 52维 AMP 状态做在线均值-方差归一化，防止量纲不同导致训练不稳定
         amp_normalizer = Normalizer(amp_data.observation_dim)
